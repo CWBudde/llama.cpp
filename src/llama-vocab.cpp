@@ -2297,6 +2297,12 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_QWEN2;
                 clean_spaces = false;
             } else if (
+                    tokenizer_pre == "kolibri") {
+                // same regex as qwen2 ("\p{N}{1}" == "\p{N}"); Kolibri has no BOS token
+                pre_type = LLAMA_VOCAB_PRE_TYPE_QWEN2;
+                clean_spaces = false;
+                special_bos_id = LLAMA_TOKEN_NULL;
+            } else if (
                     tokenizer_pre == "qwen35") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_QWEN35;
                 clean_spaces = false;

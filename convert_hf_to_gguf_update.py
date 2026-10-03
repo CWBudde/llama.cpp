@@ -165,6 +165,7 @@ models = [
     {"name": "laguna",           "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/poolside/Laguna-XS.2", },
     {"name": "ufakzeka",         "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/ufakai/ufakzeka-1", },
     {"name": "mmbert",           "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/jhu-clsp/mmBERT-base", },
+    {"name": "kolibri",          "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/Aleph-Alpha/Kolibri-1-BF16", },
 ]
 
 # some models are known to be broken upstream, so we will skip them as exceptions
