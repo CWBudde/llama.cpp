@@ -1941,6 +1941,9 @@ class TextModel(ModelBase):
         if chkhsh == "4b05e02dad1c5ae07d266fd3342ddb644c6f6be058d728bc0a33af31a1d6ee66":
             # ref: https://huggingface.co/jhu-clsp/mmBERT-base
             res = "mmbert"
+        if chkhsh == "6e040dfe72e4b85855588c53acf4909ac4e98e55bc3a33cd7db499180dc42a78":
+            # ref: https://huggingface.co/Aleph-Alpha/Kolibri-1-BF16
+            res = "kolibri"
 
         if res is None:
             logger.warning("\n")
