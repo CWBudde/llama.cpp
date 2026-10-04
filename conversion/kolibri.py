@@ -31,6 +31,12 @@ class KolibriModel(TextModel):
         self.gguf_writer.add_expert_shared_count(1)
         self.gguf_writer.add_expert_shared_feed_forward_length(hparams["shared_expert_intermediate_size"])
 
+        # the expert weights are the sigmoid of the raw router logits
+        # they are not renormalized and not scaled
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+        self.gguf_writer.add_expert_weights_norm(hparams["norm_topk_prob"])
+        self.gguf_writer.add_expert_weights_scale(1.0)
+
         # 513 = 512 previous tokens + the current token (LLAMA_SWA_TYPE_STANDARD)
         self.gguf_writer.add_sliding_window(hparams["sliding_window"])
         is_swa = [t == "sliding_attention" for t in hparams["layer_types"]]
