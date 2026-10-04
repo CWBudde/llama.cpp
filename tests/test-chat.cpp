@@ -23,6 +23,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 using json = common_json;
 
@@ -5433,8 +5434,8 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     }
 
     // Aleph-Alpha Kolibri-1 tests - ChatML, <think> reasoning, JSON tool calls in <tool_call> tags.
-    // Thinking is on by default and the model opens <think> itself; with thinking off the template
-    // prefills an empty think block. Cases follow aleph-alpha-inference tests/test_reasoning.py.
+    // Thinking is on by default and the model opens <think> itself; with thinking off the template prefills an empty think block.
+    // Cases follow aleph-alpha-inference tests/test_reasoning.py.
     {
         auto tst = peg_tester("models/templates/Aleph-Alpha-Kolibri-1.jinja", detailed_debug);
 
@@ -7774,7 +7775,7 @@ static void test_kolibri_reasoning_effort(bool detailed_debug) {
     }
 
     // server: the reasoning_effort field wins over an enable_thinking kwarg, as in vLLM
-    server_chat_params opt;
+    server_chat_params opt{};
     opt.tmpls           = read_templates("models/templates/Aleph-Alpha-Kolibri-1.jinja");
     opt.use_jinja       = true;
     opt.enable_thinking = true;
