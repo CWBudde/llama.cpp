@@ -2426,6 +2426,7 @@ static void test_role_markers_all_templates(testing & t) {
     // markers it detected first.
     const std::vector<role_marker_case> cases = {
         // ChatML family: <|im_start|>{role} ... <|im_end|>
+        { "Aleph-Alpha-Kolibri-1.jinja",                     "<|im_start|>user",       "<|im_start|>assistant"      },
         { "Bielik-11B-v3.0-Instruct.jinja",                  "<|im_start|>user",       "<|im_start|>assistant"      },
         { "HuggingFaceTB-SmolLM3-3B.jinja",                  "<|im_start|>user",       "<|im_start|>assistant"      },
         { "MiMo-VL.jinja",                                   "<|im_start|>user",       "<|im_start|>assistant"      },
