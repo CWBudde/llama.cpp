@@ -21,6 +21,12 @@ void llama_model_kolibri::load_arch_hparams(llama_model_loader & ml) {
     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,   hparams.is_swa_impl);
     ml.get_arr(LLM_KV_ATTENTION_ROPE_PATTERN,             hparams.rope_pattern);
 
+    // RoPE runs on the sliding-window layers, so the SWA frequencies are the model's own;
+    // the KV-cache shift reads them through get_rope_freq_base/scale, like the graph below
+    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+    hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+    ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,                 hparams.rope_freq_base_train_swa, false);
+
     type = LLM_TYPE_UNKNOWN;
 }
 
@@ -88,6 +94,9 @@ llama_model_kolibri::graph::graph(const llama_model & model, const llm_graph_par
 
         ggml_tensor * inpSA = inpL;
 
+        const float freq_base_l  = model.get_rope_freq_base (cparams, il);
+        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+
         cur = build_norm(inpL, layer.attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
@@ -103,10 +112,10 @@ llama_model_kolibri::graph::graph(const llama_model & model, const llm_graph_par
 
             if (hparams.has_rope(il)) {
                 Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
-                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
-                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(Qcur, "Qcur_rope", il);
                 cb(Kcur, "Kcur_rope", il);
