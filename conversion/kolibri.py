@@ -26,5 +26,5 @@ class KolibriModel(TextModel):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # the generic TensorNameMap maps the sandwich norms to wrong tensors and does not stack the per-expert tensors
-        # fail here, do not write a wrong GGUF
-        raise NotImplementedError(f"Kolibri tensor conversion is not implemented yet ({name})")
+        # fail here, do not write a wrong GGUF; only --vocab-only works for now
+        raise NotImplementedError(f"Kolibri tensor conversion is not implemented yet, use --vocab-only ({name})")
