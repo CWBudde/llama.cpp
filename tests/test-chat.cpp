@@ -23,6 +23,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 using json = common_json;
 
@@ -5432,6 +5433,115 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // Aleph-Alpha Kolibri-1 tests - ChatML, <think> reasoning, JSON tool calls in <tool_call> tags.
+    // Thinking is on by default and the model opens <think> itself; with thinking off the template prefills an empty think block.
+    // Cases follow aleph-alpha-inference tests/test_reasoning.py.
+    {
+        auto tst = peg_tester("models/templates/Aleph-Alpha-Kolibri-1.jinja", detailed_debug);
+
+        common_chat_msg tool_result;
+        tool_result.role         = "tool";
+        tool_result.tool_call_id = "0";
+        tool_result.content      = "result";
+
+        // thinking on: the reasoning, then the answer
+        tst.test("<think>\nI'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .expect(message_assist_thoughts)
+            .run();
+
+        // ... also after a tool loop
+        tst.test("<think>\nI'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_call_idx, tool_result })
+            .expect(message_assist_thoughts)
+            .run();
+
+        // reasoning format none keeps the think block in the content
+        tst.test("<think>\nI'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .enable_thinking(true)
+            .expect_content("<think>\nI'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+            .run();
+
+        // output cut off inside the think block is reasoning
+        tst.test("<think>\nstill")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .is_partial(true)
+            .expect_reasoning("still")
+            .run();
+
+        // thinking off: the prompt already closed the think block, so the output is content
+        tst.test("Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .expect(message_assist)
+            .run();
+
+        tst.test("Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .messages({ message_user, message_assist_call_idx, tool_result })
+            .expect(message_assist)
+            .run();
+
+        // tool call after the reasoning
+        tst.test("<think>\nI'm\nthinking\n</think>\n\n"
+                 "<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .run();
+
+        // tool call with thinking off
+        tst.test("<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // content, then two calls; the template separates them with newlines
+        tst.test("Hello, world!\nWhat's up?\n"
+                 "<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n</tool_call>\n"
+                 "<tool_call>\n{\"name\": \"special_function_with_opt\", \"arguments\": {\"arg1\": 1, \"arg2\": 2}}\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, special_function_tool_with_optional_param })
+            .expect_content("Hello, world!\nWhat's up?")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .run();
+
+        // partial tool call (streaming)
+        tst.test("<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\":")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .tools({ special_function_tool })
+            .is_partial(true)
+            .expect(simple_assist_msg("", "", "special_function", "{\"arg1\": "))
+            .run();
+
+        // a tool call marker inside the reasoning is reasoning
+        tst.test("<think>\nLet me think about <tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 2}}\n</tool_call> hmm\n</think>\n\n"
+                 "<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ special_function_tool })
+            .expect_reasoning("Let me think about <tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 2}}\n</tool_call> hmm")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+            })
+            .run();
+    }
+
 
     // Apertus-8B-Instruct tests - FUNC_NAME_AS_KEY format
     // Format: <|tools_prefix|>[{"function_name": {...arguments...}}]<|tools_suffix|>
@@ -7586,8 +7696,101 @@ static void test_reasoning_effort_caps() {
     assert_supports_effort("models/templates/openai-gpt-oss-120b.jinja", true);
     assert_supports_effort("models/templates/upstage-Solar-Open-100B.jinja", true);
     assert_supports_effort("models/templates/Cohere2MoE.jinja", true);
+    assert_supports_effort("models/templates/Aleph-Alpha-Kolibri-1.jinja", true);
     assert_supports_effort("models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja", false);
     assert_supports_effort("models/templates/Qwen-Qwen3-0.6B.jinja", false);
+}
+
+// Kolibri-1: reasoning_effort wins over enable_thinking, and the prompt ends in an empty think block iff thinking is off.
+// Kwarg sets from aleph-alpha-inference tests/test_reasoning.py (THINKING_OFF_KWARGS, THINKING_ON_KWARGS).
+static void test_kolibri_reasoning_effort(bool detailed_debug) {
+    LOG_DBG("%s\n", __func__);
+
+    auto tmpls = read_templates("models/templates/Aleph-Alpha-Kolibri-1.jinja");
+    const std::string prefilled = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+    common_chat_msg tool_result;
+    tool_result.role         = "tool";
+    tool_result.tool_call_id = "0";
+    tool_result.content      = "result";
+
+    struct effort_case {
+        std::map<std::string, std::string> kwargs;
+        bool                               thinking;
+    };
+    const std::vector<effort_case> cases = {
+        { { { "enable_thinking", "false" } }, false },
+        { { { "reasoning_effort", "null" }, { "enable_thinking", "false" } }, false },
+        { { { "reasoning_effort", "\"none\"" } }, false },
+        { { { "reasoning_effort", "\"none\"" }, { "enable_thinking", "true" } }, false },
+        { {}, true },
+        { { { "reasoning_effort", "null" } }, true },
+        { { { "enable_thinking", "true" } }, true },
+        { { { "enable_thinking", "null" } }, true },
+        { { { "reasoning_effort", "\"high\"" } }, true },
+        { { { "reasoning_effort", "\"low\"" }, { "enable_thinking", "false" } }, true },
+    };
+    for (const auto & messages : std::vector<std::vector<common_chat_msg>>{
+             { message_user },
+             { message_user, message_assist_call_idx, tool_result },
+         }) {
+        for (const auto & c : cases) {
+            common_chat_templates_inputs inputs;
+            inputs.messages             = messages;
+            inputs.chat_template_kwargs = c.kwargs;
+            inputs.reasoning_format     = COMMON_REASONING_FORMAT_AUTO;
+            // as llama-server sets it from the enable_thinking kwarg
+            auto it                = c.kwargs.find("enable_thinking");
+            inputs.enable_thinking = it == c.kwargs.end() || it->second != "false";
+
+            auto params = common_chat_templates_apply(tmpls.get(), inputs);
+            assert_equals(!c.thinking, string_ends_with(params.prompt, prefilled));
+
+            test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+                tc.params = inputs;
+                if (c.thinking) {
+                    tc.input  = "<think>\nthinking\n</think>\n\nThe answer.";
+                    tc.expect = simple_assist_msg("The answer.", "thinking");
+                } else {
+                    tc.input  = "The answer.";
+                    tc.expect = simple_assist_msg("The answer.");
+                }
+            }, detailed_debug);
+        }
+    }
+
+    const std::string low    = "Reasoning effort is set to low.";
+    const std::string medium = "Reasoning effort is set to medium.";
+    const std::string high   = "Reasoning effort is set to high.";
+    const std::vector<std::pair<std::string, std::string>> sentences = {
+        { "\"none\"", "Reasoning is disabled." },
+        { "\"minimal\"", low }, { "\"low\"", low }, { "\"medium\"", medium },
+        { "\"high\"", high }, { "\"xhigh\"", high }, { "\"max\"", high },
+    };
+    for (const auto & [effort, sentence] : sentences) {
+        common_chat_templates_inputs inputs;
+        inputs.messages                                 = { message_user };
+        inputs.chat_template_kwargs["reasoning_effort"] = effort;
+        assert_contains(common_chat_templates_apply(tmpls.get(), inputs).prompt, "# Reasoning effort\n\n" + sentence);
+    }
+
+    // server: the reasoning_effort field wins over an enable_thinking kwarg, as in vLLM
+    server_chat_params opt{};
+    opt.tmpls           = read_templates("models/templates/Aleph-Alpha-Kolibri-1.jinja");
+    opt.use_jinja       = true;
+    opt.enable_thinking = true;
+    for (const auto & [effort, enable_thinking, thinking] : std::vector<std::tuple<std::string, bool, bool>>{
+             { "none", true, false }, { "none", false, false }, { "low", false, true }, { "high", true, true },
+         }) {
+        json body = {
+            { "messages", json::array({ json{ { "role", "user" }, { "content", "hello" } } }) },
+            { "reasoning_effort", effort },
+            { "chat_template_kwargs", { { "enable_thinking", enable_thinking } } },
+        };
+        std::vector<raw_buffer> out_files;
+        auto prompt = oaicompat_chat_params_parse(body, opt, out_files).at("prompt").get<std::string>();
+        assert_equals(!thinking, string_ends_with(prompt, prefilled));
+    }
 }
 
 static void test_msg_diffs_compute() {
@@ -7750,6 +7953,7 @@ int main(int argc, char ** argv) {
         test_deepseek_v4_tool_result_ordering();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
+        test_kolibri_reasoning_effort(detailed_debug);
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);
