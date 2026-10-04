@@ -2041,7 +2041,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
-        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS || arch == LLM_ARCH_KOLIBRI) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
@@ -2093,6 +2093,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (arch == LLM_ARCH_GROVEMOE) {
         selection_probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
+        cb(selection_probs, "ffn_moe_probs_biased", il);
+    }
+
+    // kolibri adds the selection bias to the raw logits, not to the sigmoid probs
+    // the expert weights stay sigmoid(logits) without the bias
+    if (arch == LLM_ARCH_KOLIBRI && exp_probs_b != nullptr) {
+        selection_probs = ggml_add(ctx0, logits, exp_probs_b); // [n_expert, n_tokens]
         cb(selection_probs, "ffn_moe_probs_biased", il);
     }
 
