@@ -16,7 +16,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
-using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
+// file index -> the backend buffers that map that file, one per mapped range
+using llama_buf_map = std::unordered_multimap<uint32_t, ggml_backend_buffer_t>;
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -242,7 +243,9 @@ struct llama_model_loader {
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
-    void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
+    // the byte ranges [first, last) of file idx that hold the tensors of ctx, sorted
+    // ranges closer than max_gap bytes are merged into one
+    std::vector<std::pair<size_t, size_t>> get_mapping_ranges(int idx, ggml_context * ctx, size_t max_gap) const;
 
     // release a weight's mmap pages
     void unmap_weight(const llama_tensor_weight & w) const;
