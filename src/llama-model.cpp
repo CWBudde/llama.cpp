@@ -1863,8 +1863,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
                 //     then we could just use metal for all layers
                 // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
-                // the tensors of one context can be spread over the whole file, e.g. with the MoE experts kept on the CPU,
-                //     so each run of nearby tensors gets its own buffer, and the gaps between them stay unmapped
+                // the tensors of one context can spread over the whole file (e.g. MoE experts kept on the CPU), so map each run of nearby tensors as its own buffer
                 const size_t max_gap = 16u*1024*1024;
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 char * addr = (char *) ml.mappings.at(idx)->addr();
