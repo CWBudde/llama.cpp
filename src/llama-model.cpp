@@ -38,6 +38,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1862,19 +1863,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
                 //     then we could just use metal for all layers
                 // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
-                void * addr = nullptr;
-                size_t first, last; // NOLINT
-                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-                if (first >= last) {
-                    continue;
-                }
+                // the tensors of one context can spread over the whole file (e.g. MoE experts kept on the CPU), so map each run of nearby tensors as its own buffer
+                const size_t max_gap = 16u*1024*1024;
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
-                if (buf == nullptr) {
-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                char * addr = (char *) ml.mappings.at(idx)->addr();
+                for (const auto & [first, last] : ml.get_mapping_ranges(idx, ctx, max_gap)) {
+                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, addr + first, last - first, max_size);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    }
+                    bufs.emplace_back(buf);
+                    buf_map.emplace(idx, buf);
                 }
-                bufs.emplace_back(buf);
-                buf_map.emplace(idx, buf);
             }
         } else {
             ggml_backend_buffer_t buf;
@@ -1928,11 +1928,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
 
-    // print memory requirements per buffer type
-    for (auto & [_, bufs] : pimpl->ctxs_bufs) {
-        for (auto & buf: bufs) {
-            LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
-                __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
+    // print memory requirements per buffer type, summed over the buffers of a type (a mapped context can have many)
+    {
+        std::vector<std::tuple<std::string, size_t, int>> buf_sizes; // name, size, number of buffers
+        for (auto & [_, bufs] : pimpl->ctxs_bufs) {
+            for (auto & buf: bufs) {
+                const std::string name = ggml_backend_buffer_name(buf.get());
+                auto it = std::find_if(buf_sizes.begin(), buf_sizes.end(), [&](const auto & e) { return std::get<0>(e) == name; });
+                if (it == buf_sizes.end()) {
+                    buf_sizes.emplace_back(name, 0, 0);
+                    it = buf_sizes.end() - 1;
+                }
+                std::get<1>(*it) += ggml_backend_buffer_get_size(buf.get());
+                std::get<2>(*it) += 1;
+            }
+        }
+        for (const auto & [name, size, n] : buf_sizes) {
+            if (n > 1) {
+                LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB (%d buffers)\n", __func__, name.c_str(), size / 1024.0 / 1024.0, n);
+            } else {
+                LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n", __func__, name.c_str(), size / 1024.0 / 1024.0);
+            }
         }
     }
 
