@@ -5540,6 +5540,59 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 { "special_function", R"({"arg1": 1})", {} },
             })
             .run();
+
+        // Continuing the final assistant message. The template renders a continued message with its think
+        // block closed, whatever the thinking switch says, and so does llama.cpp for a content continuation.
+        // vLLM's parser does not account for that: with thinking on, it parses the continuation as reasoning
+        // (aleph-alpha-inference reasoning.py). llama.cpp parses it after the prompt, so it is content.
+        for (bool thinking : { true, false }) {
+            tst.test("world!\nWhat's up?")
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .enable_thinking(thinking)
+                .messages({ message_user, message_assist_prefill_content })
+                .add_generation_prompt(false)
+                .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+                .expect_reasoning("I'm thinking")
+                .expect_content("Hello, world!\nWhat's up?")
+                .run();
+
+            // a continuation may still call a tool
+            tst.test("world!\n<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n</tool_call>")
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .enable_thinking(thinking)
+                .messages({ message_user, message_assist_prefill_content })
+                .add_generation_prompt(false)
+                .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+                .tools({ special_function_tool })
+                .expect_reasoning("I'm thinking")
+                .expect_content("Hello, world!")
+                .expect_tool_calls({
+                    { "special_function", R"({"arg1": 1})", {} },
+                })
+                .run();
+        }
+
+        // A reasoning-only message continues inside the think block: llama.cpp leaves it open, where the
+        // reference renders it closed and continues with content.
+        tst.test(" thinking\n</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_reasoning })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test(" thinking\n</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .messages({ message_user, message_assist_prefill_reasoning })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
     }
 
 
