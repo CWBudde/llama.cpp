@@ -1671,6 +1671,21 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
+
+    if (params.expert_cache > 0 || !params.expert_cache_layers.empty()) {
+        auto & ec = params.expert_cache_lp;
+        ec = llama_expert_cache_default_params();
+        ec.n_slots            = params.expert_cache;
+        ec.n_slots_layer      = params.expert_cache_layers.empty() ? nullptr : params.expert_cache_layers.data();
+        ec.n_layer_slots      = (int32_t) params.expert_cache_layers.size();
+        ec.n_threads          = params.expert_cache_threads;
+        ec.prefetch_k         = params.expert_prefetch_k;
+        ec.prefetch_half_life = params.expert_prefetch_half_life;
+        ec.prefetch_mix       = params.expert_prefetch_mix;
+        ec.stats_path         = params.expert_cache_stats.empty() ? nullptr : params.expert_cache_stats.c_str();
+        mparams.expert_cache  = &ec;
+    }
+
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;

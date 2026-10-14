@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-expert-cache.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -247,6 +248,19 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // [EXPERIMENTAL] with the expert cache, the experts of every ubatch must fit its slots
+    if (model.expert_cache) {
+        // refused early, before buffers are allocated; attach() below decides
+        if (model.expert_cache->in_use()) {
+            throw std::runtime_error("the expert cache serves one context per model, and it has one");
+        }
+        const uint32_t cap = model.expert_cache->max_ubatch();
+        if (cparams.n_ubatch > cap) {
+            LLAMA_LOG_WARN("%s: n_ubatch %u capped to %u, so that a ubatch's experts fit the expert cache\n", __func__, cparams.n_ubatch, cap);
+            cparams.n_ubatch = cap;
+        }
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
@@ -478,11 +492,24 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // [EXPERIMENTAL] the expert cache serves one context; taken last, so that a constructor that
+    // throws before never holds it (its destructor would not run to give it back)
+    if (model.expert_cache) {
+        if (!model.expert_cache->attach()) {
+            throw std::runtime_error("the expert cache serves one context per model, and it has one");
+        }
+        expert_cache_attached = true;
+    }
 }
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (expert_cache_attached) {
+        model.expert_cache->detach();
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {

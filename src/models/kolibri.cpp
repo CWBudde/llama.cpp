@@ -43,6 +43,9 @@ void llama_model_kolibri::load_arch_tensors(llama_model_loader &) {
     const int64_t n_ff_exp   = hparams.n_ff_exp();
     const int64_t n_ff_shexp = hparams.n_ff_shexp;
 
+    // with the expert cache, the stacked experts are read from the file into its slots, never mapped to a device
+    const int exps_flags = expert_cache_requested() ? TENSOR_READ_LAZY : 0;
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
@@ -60,9 +63,9 @@ void llama_model_kolibri::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
 
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, exps_flags);
+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, exps_flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, exps_flags);
 
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,     n_ff_shexp}, 0);
         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,     n_ff_shexp}, 0);
@@ -79,6 +82,9 @@ std::unique_ptr<llm_graph_context> llama_model_kolibri::build_arch_graph(const l
 llama_model_kolibri::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    // build_moe_ffn reads the experts from the cache's slots, if there is one
+    expert_cache = model.expert_cache.get();
 
     ggml_tensor * cur;
     ggml_tensor * inpL = build_inp_embd(model.tok_embd);

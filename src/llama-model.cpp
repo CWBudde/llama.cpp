@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
+#include "llama-expert-cache.h"
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
@@ -1290,9 +1291,17 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    // the cache's I/O threads go before anything they could touch
+    expert_cache.reset();
+
     for (auto * lora : loras) {
         delete lora;
     }
+}
+
+bool llama_model::expert_cache_requested() const {
+    const auto * p = params.expert_cache;
+    return p && (p->n_slots > 0 || (p->n_slots_layer && p->n_layer_slots > 0));
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -1632,6 +1641,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
 
         layers.resize(n_layer_all);
+
+        if (expert_cache_requested()) {
+            if (arch != LLM_ARCH_KOLIBRI) {
+                throw std::runtime_error(format("the expert cache supports the kolibri architecture only, not %s", llm_arch_name(arch)));
+            }
+            // the stacked experts stay in the file: lazy tensors, mapped on the CPU and never read
+            ml.lazy.mode = LLAMA_LAZY_MODE_ON;
+        }
 
         // call the per-model loading function
         load_arch_tensors(ml);
@@ -1975,6 +1992,36 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    if (expert_cache_requested()) {
+        const int n_layer = (int) hparams.n_layer();
+        expert_cache = std::make_unique<llama_expert_cache>(*params.expert_cache, n_layer, (int) hparams.n_expert, (int) hparams.n_expert_used_max());
+        std::vector<llama_expert_cache::tensors> stacked(n_layer);
+        int fd = -1;
+        int idx = -1;
+        for (int il = 0; il < n_layer; ++il) {
+            ggml_tensor * t[3] = { layers[il].ffn_gate_exps, layers[il].ffn_up_exps, layers[il].ffn_down_exps };
+            for (int k = 0; k < 3; ++k) {
+                if (!t[k] || !ml.lazy.has(t[k])) {
+                    throw std::runtime_error(format("expert cache: layer %d's stacked experts are not lazy tensors (is mmap available?)", il));
+                }
+                const auto & w = ml.require_weight(ggml_get_name(t[k]));
+                if (idx >= 0 && w.idx != idx) {
+                    throw std::runtime_error("expert cache: the experts span several files");
+                }
+                idx = w.idx;
+                stacked[il].t[k]    = t[k];
+                stacked[il].offs[k] = w.offs;
+            }
+        }
+        fd = ml.files.at(idx)->file_id();
+        // each layer's slots go to the device of its other weights
+        std::vector<ggml_backend_dev_t> devs(n_layer);
+        for (int il = 0; il < n_layer; ++il) {
+            devs[il] = pimpl->dev_layer.at(il).dev;
+        }
+        expert_cache->init(stacked, devs, fd);
     }
 
     return true;
@@ -2959,6 +3006,22 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.expert_cache                =*/ nullptr,
+    };
+
+    return result;
+}
+
+llama_expert_cache_params llama_expert_cache_default_params() {
+    llama_expert_cache_params result = {
+        /*.n_slots            =*/ 0,
+        /*.n_slots_layer      =*/ nullptr,
+        /*.n_layer_slots      =*/ 0,
+        /*.n_threads          =*/ 4,
+        /*.prefetch_k         =*/ 0,
+        /*.prefetch_half_life =*/ 1,
+        /*.prefetch_mix       =*/ 0.75f,
+        /*.stats_path         =*/ nullptr,
     };
 
     return result;
