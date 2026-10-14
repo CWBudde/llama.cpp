@@ -346,10 +346,10 @@ llama_context::llama_context(
 
     // [EXPERIMENTAL] with the expert cache, the experts of every ubatch must fit its slots
     if (model.expert_cache) {
-        if (!model.expert_cache->attach()) {
+        // refused early, before buffers are allocated; attach() below decides
+        if (model.expert_cache->in_use()) {
             throw std::runtime_error("the expert cache serves one context per model, and it has one");
         }
-        expert_cache_attached = true;
         const uint32_t cap = model.expert_cache->max_ubatch();
         if (cparams.n_ubatch > cap) {
             LLAMA_LOG_WARN("%s: n_ubatch %u capped to %u, so that a ubatch's experts fit the expert cache\n", __func__, cparams.n_ubatch, cap);
@@ -593,6 +593,15 @@ llama_context::llama_context(
         for (int i = 0; i < n_vocab; ++i) {
             sampling.token_ids_full_vocab[i] = i;
         }
+    }
+
+    // [EXPERIMENTAL] the expert cache serves one context; taken last, so that a constructor that
+    // throws before never holds it (its destructor would not run to give it back)
+    if (model.expert_cache) {
+        if (!model.expert_cache->attach()) {
+            throw std::runtime_error("the expert cache serves one context per model, and it has one");
+        }
+        expert_cache_attached = true;
     }
 }
 

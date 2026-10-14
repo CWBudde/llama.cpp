@@ -1349,6 +1349,9 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    // the cache's I/O threads go before anything they could touch
+    expert_cache.reset();
+
     for (auto * lora : loras) {
         delete lora;
     }
@@ -2088,8 +2091,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
         fd = ml.files.at(idx)->file_id();
-        // the slots live where the layers' other weights live
-        expert_cache->init(stacked, fd, pimpl->dev_layer.at(0).buft_list->front().second);
+        // each layer's slots go to the device of its other weights
+        std::vector<ggml_backend_dev_t> devs(n_layer);
+        for (int il = 0; il < n_layer; ++il) {
+            devs[il] = pimpl->dev_layer.at(il).dev;
+        }
+        expert_cache->init(stacked, devs, fd);
     }
 
     return true;
@@ -3411,13 +3418,13 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
-        /*.expert_cache                =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.expert_cache                =*/ nullptr,
     };
 
     return result;

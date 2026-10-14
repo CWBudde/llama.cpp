@@ -2,6 +2,8 @@
 
 #include "llama-impl.h"
 
+#include "ggml-alloc.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -11,23 +13,61 @@
 #if defined(__APPLE__)
 #include <fcntl.h>
 #include <libproc.h>
+#include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #elif defined(__linux__)
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
 
 namespace {
 
+// the counters this platform measures; the others are reported as null
 struct process_counts {
     uint64_t disk_read = 0;
     uint64_t pageins   = 0;
     uint64_t faults    = 0;
     uint64_t max_phys_footprint = 0;
+#if defined(__APPLE__)
+    static constexpr bool has_io     = true; // disk_read, pageins, max_phys_footprint
+#else
+    static constexpr bool has_io     = false;
+#endif
+#if defined(__APPLE__) || defined(__linux__)
+    static constexpr bool has_faults = true;
+#else
+    static constexpr bool has_faults = false;
+#endif
 };
+
+std::string json_u64(bool measured, uint64_t v) {
+    return measured ? std::to_string(v) : std::string("null");
+}
+
+// s as a JSON string, quotes included
+std::string json_string(const std::string & s) {
+    std::string out = "\"";
+    for (const unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    out += format("\\u%04x", c);
+                } else {
+                    out += (char) c;
+                }
+        }
+    }
+    return out + "\"";
+}
 
 process_counts process_now() {
     process_counts c;
@@ -116,30 +156,61 @@ llama_expert_cache::~llama_expert_cache() {
             }
         }
     }
+#if defined(__APPLE__) || defined(__linux__)
     if (fd >= 0) {
         close(fd);
     }
-    if (buf) {
-        ggml_backend_buffer_free(buf);
-    }
-    if (ctx) {
-        ggml_free(ctx);
+#endif
+    for (auto & gr : groups) {
+        if (gr.buf) {
+            ggml_backend_buffer_free(gr.buf);
+        }
+#if defined(__APPLE__) || defined(__linux__)
+        if (gr.host) {
+            munmap(gr.host, gr.size);
+        }
+#endif
+        if (gr.ctx) {
+            ggml_free(gr.ctx);
+        }
     }
 }
 
-void llama_expert_cache::init(const std::vector<tensors> & stacked_in, int fd_loader, ggml_backend_buffer_type_t buft) {
-    GGML_ASSERT((int) stacked_in.size() == n_layer);
+size_t llama_expert_cache::slot_bytes() const {
+    size_t n = 0;
+    for (const auto & gr : groups) {
+        n += gr.buf ? ggml_backend_buffer_get_size(gr.buf) : 0;
+    }
+    return n;
+}
+
+void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std::vector<ggml_backend_dev_t> & devs, int fd_loader) {
+    GGML_ASSERT((int) stacked_in.size() == n_layer && (int) devs.size() == n_layer);
     stacked = stacked_in;
 
-    // the slot tensors: the stacked tensors' first two dimensions, n_slots experts
-    ggml_init_params ip = {
-        /*.mem_size   =*/ ggml_tensor_overhead()*3*n_layer,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    ctx = ggml_init(ip);
-    if (!ctx) {
-        throw std::runtime_error("expert cache: ggml_init failed");
+    // one group of slot tensors per device: the stacked tensors' first two dimensions, n_slots experts
+    std::vector<int> group_of(n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        int g = 0;
+        while (g < (int) groups.size() && groups[g].dev != devs[il]) {
+            g++;
+        }
+        if (g == (int) groups.size()) {
+            groups.push_back({});
+            groups[g].dev = devs[il];
+        }
+        group_of[il] = g;
+    }
+    for (auto & gr : groups) {
+        ggml_init_params ip = {
+            /*.mem_size   =*/ ggml_tensor_overhead()*3*n_layer,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        gr.ctx = ggml_init(ip);
+        if (!gr.ctx) {
+            throw std::runtime_error("expert cache: ggml_init failed");
+        }
     }
     static const char * names[3] = { "ffn_gate_exps_slots", "ffn_up_exps_slots", "ffn_down_exps_slots" };
     slot_t.resize(n_layer);
@@ -151,7 +222,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, int fd_lo
             if (!s || s->ne[2] != n_expert || !ggml_is_contiguous(s)) {
                 throw std::runtime_error(format("expert cache: layer %d has no contiguous stacked tensor %s of %d experts", il, names[k], n_expert));
             }
-            ggml_tensor * t = ggml_new_tensor_3d(ctx, s->type, s->ne[0], s->ne[1], n_slots[il]);
+            ggml_tensor * t = ggml_new_tensor_3d(groups[group_of[il]].ctx, s->type, s->ne[0], s->ne[1], n_slots[il]);
             ggml_format_name(t, "blk.%d.%s", il, names[k]);
             GGML_ASSERT(t->nb[2] == s->nb[2]);
             slot_t[il].t[k] = t;
@@ -159,14 +230,51 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, int fd_lo
         }
         expert_bytes[il] = bytes;
     }
-    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
-    if (!buf) {
-        throw std::runtime_error(format("expert cache: cannot allocate the slots in %s", ggml_backend_buft_name(buft)));
-    }
-    // the slots hold weights: the scheduler runs the expert matmuls where they are
-    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    if (ggml_backend_buffer_get_base(buf) == nullptr) {
-        throw std::runtime_error("expert cache: the slot buffer is not addressable from the host");
+
+    for (auto & gr : groups) {
+        const char * dev_name = ggml_backend_dev_name(gr.dev);
+        if (ggml_backend_dev_type(gr.dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            // the device's own buffer type is plain host memory, unlike the repacking extra types
+            gr.buf = ggml_backend_alloc_ctx_tensors_from_buft(gr.ctx, ggml_backend_dev_buffer_type(gr.dev));
+        } else {
+#if defined(__APPLE__) || defined(__linux__)
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(gr.dev, &props);
+            if (!props.caps.buffer_from_host_ptr) {
+                throw std::runtime_error(format("expert cache: %s cannot use host memory for the slots (no buffer_from_host_ptr); "
+                    "the cache needs the expert layers on the CPU or on a device that can, such as Metal", dev_name));
+            }
+            // host memory the device uses in place: the I/O threads read into it, nothing is copied;
+            // an anonymous mapping, so slots never written cost no memory
+            const size_t align = (size_t) std::max(sysconf(_SC_PAGESIZE), 4096L); // also covers the buffer's own alignment
+            size_t max_tensor = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(gr.ctx); t; t = ggml_get_next_tensor(gr.ctx, t)) {
+                gr.size += GGML_PAD(ggml_nbytes(t), align);
+                max_tensor = std::max(max_tensor, ggml_nbytes(t));
+            }
+            gr.host = mmap(nullptr, gr.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (gr.host == MAP_FAILED) {
+                gr.host = nullptr;
+                throw std::runtime_error(format("expert cache: cannot map %zu bytes for the slots: %s", gr.size, strerror(errno)));
+            }
+            gr.buf = ggml_backend_dev_buffer_from_host_ptr(gr.dev, gr.host, gr.size, max_tensor);
+            if (gr.buf) {
+                ggml_tallocr ta = ggml_tallocr_new(gr.buf);
+                for (ggml_tensor * t = ggml_get_first_tensor(gr.ctx); t; t = ggml_get_next_tensor(gr.ctx, t)) {
+                    if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+                        throw std::runtime_error(format("expert cache: cannot place %s in the slot buffer of %s", ggml_get_name(t), dev_name));
+                    }
+                }
+            }
+#else
+            throw std::runtime_error(format("expert cache: the slots of %s need host memory the device can use, not supported on this platform", dev_name));
+#endif
+        }
+        if (!gr.buf) {
+            throw std::runtime_error(format("expert cache: cannot allocate the slots for %s", dev_name));
+        }
+        // the slots hold weights: the scheduler runs the expert matmuls where they are
+        ggml_backend_buffer_set_usage(gr.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
 
 #if defined(__APPLE__)
@@ -210,10 +318,13 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, int fd_lo
     const std::string pf = markov
         ? format("markov same-token k %d, half-life %d, mix %g (%.1f MiB)", prefetch_k, prefetch_half_life, prefetch_mix, markov->bytes()/1024.0/1024.0)
         : std::string("off");
-    LLAMA_LOG_INFO("%s: %d to %d slots per layer of %d experts, %.2f MiB in %s, %d I/O threads, prefetch %s, reading %s\n",
+    std::string where;
+    for (const auto & gr : groups) {
+        where += format("%s%.2f MiB for %s", where.empty() ? "" : ", ", ggml_backend_buffer_get_size(gr.buf)/1024.0/1024.0, ggml_backend_dev_name(gr.dev));
+    }
+    LLAMA_LOG_INFO("%s: %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, reading %s\n",
         __func__, *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
-        n_expert, ggml_backend_buffer_get_size(buf)/1024.0/1024.0, ggml_backend_buft_name(buft), n_threads,
-        pf.c_str(), path.c_str());
+        n_expert, where.c_str(), n_threads, pf.c_str(), path.c_str());
 }
 
 uint32_t llama_expert_cache::max_ubatch() const {
@@ -221,11 +332,7 @@ uint32_t llama_expert_cache::max_ubatch() const {
 }
 
 bool llama_expert_cache::attach() {
-    if (attached) {
-        return false;
-    }
-    attached = true;
-    return true;
+    return !attached.exchange(true);
 }
 
 void llama_expert_cache::detach() {
@@ -274,6 +381,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
 }
 
 bool llama_expert_cache::load(int il, int e, int s) {
+#if defined(__APPLE__) || defined(__linux__)
     for (int k = 0; k < 3; ++k) {
         const ggml_tensor * t = slot_t[il].t[k];
         const size_t n   = t->nb[2];
@@ -294,6 +402,12 @@ bool llama_expert_cache::load(int il, int e, int s) {
         }
     }
     return true;
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(e);
+    GGML_UNUSED(s);
+    return false;
+#endif
 }
 
 std::string llama_expert_cache::stats_json() const {
@@ -302,12 +416,12 @@ std::string llama_expert_cache::stats_json() const {
     const int s_max = *std::max_element(n_slots.begin(), n_slots.end());
     return format(
         "{\"expert_cache\": {\"slots_min\": %d, \"slots_max\": %d, \"slot_bytes\": %zu, \"expert_bytes\": %zu, "
-        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"file\": \"%s\"}, "
+        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"file\": %s}, "
         "\"prefill\": %s, \"decode\": %s, "
-        "\"process\": {\"disk_bytes_read\": %llu, \"pageins\": %llu, \"major_faults\": %llu, \"max_phys_footprint\": %llu}}",
-        s_min, s_max, buf ? ggml_backend_buffer_get_size(buf) : (size_t) 0, expert_bytes.empty() ? (size_t) 0 : expert_bytes[0],
-        n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, path.c_str(),
+        "\"process\": {\"disk_bytes_read\": %s, \"pageins\": %s, \"major_faults\": %s, \"max_phys_footprint\": %s}}",
+        s_min, s_max, slot_bytes(), expert_bytes.empty() ? (size_t) 0 : expert_bytes[0],
+        n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, json_string(path).c_str(),
         counts_json(slots->counts(false)).c_str(), counts_json(slots->counts(true)).c_str(),
-        (unsigned long long) (pc.disk_read - disk_read0), (unsigned long long) (pc.pageins - pageins0),
-        (unsigned long long) (pc.faults - faults0), (unsigned long long) pc.max_phys_footprint);
+        json_u64(pc.has_io, pc.disk_read - disk_read0).c_str(), json_u64(pc.has_io, pc.pageins - pageins0).c_str(),
+        json_u64(pc.has_faults, pc.faults - faults0).c_str(), json_u64(pc.has_io, pc.max_phys_footprint).c_str());
 }
