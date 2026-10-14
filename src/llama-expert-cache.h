@@ -15,6 +15,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -36,9 +37,10 @@ struct llama_expert_cache {
     ~llama_expert_cache();
 
     // init takes the stacked expert tensors and their offsets in the file the loader opened as fd,
-    // allocates the slots in buft, opens the file for its own reads and starts the I/O threads;
-    // it throws on failure
-    void init(const std::vector<tensors> & stacked, int fd, ggml_backend_buffer_type_t buft);
+    // allocates each layer's slots for that layer's device, opens the file for its own reads and
+    // starts the I/O threads; it throws on failure. The slots are host memory, which pread writes:
+    // a CPU buffer, or host memory the device uses in place (buffer_from_host_ptr, e.g. Metal).
+    void init(const std::vector<tensors> & stacked, const std::vector<ggml_backend_dev_t> & devs, int fd);
 
     // the largest ubatch whose experts always fit: the fewest slots of a layer over n_expert_used
     uint32_t max_ubatch() const;
@@ -46,6 +48,7 @@ struct llama_expert_cache {
     // one context per model
     bool attach();
     void detach();
+    bool in_use() const { return attached; }
 
     // the slot ids of the router's selected experts [n_expert_used, n_tokens], from a CPU op
     ggml_tensor * build_remap(ggml_context * ctx, ggml_tensor * selected_experts, int il);
@@ -75,8 +78,17 @@ private:
     std::vector<size_t>   expert_bytes; // per layer
     std::vector<layer_ud> ud;
 
-    ggml_context *        ctx = nullptr;
-    ggml_backend_buffer_t buf = nullptr;
+    // the slots of the layers of one device
+    struct group {
+        ggml_backend_dev_t    dev  = nullptr;
+        ggml_context *        ctx  = nullptr;
+        ggml_backend_buffer_t buf  = nullptr;
+        void *                host = nullptr; // the mapping the device's buffer wraps, if any
+        size_t                size = 0;
+    };
+    std::vector<group> groups;
+    size_t slot_bytes() const;
+
     std::string path;
     int fd = -1;
 
@@ -84,7 +96,7 @@ private:
     std::unique_ptr<llama_expert_markov> markov;
     std::vector<int> pred;
 
-    bool    attached  = false;
+    std::atomic<bool> attached{false};
     int64_t tok_first = 0; // the first token of the ubatch being computed
     int64_t tok_next  = 0;
     bool    decode    = false;
