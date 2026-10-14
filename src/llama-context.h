@@ -425,6 +425,9 @@ private:
 
     bool has_evaluated_once = false;
 
+    // this context holds the model's expert cache
+    bool expert_cache_attached = false;
+
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 

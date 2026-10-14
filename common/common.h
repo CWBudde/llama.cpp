@@ -533,6 +533,16 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
+    // [EXPERIMENTAL] bounded expert cache (--expert-cache and the options after it)
+    int32_t              expert_cache              = 0;     // slots per layer, 0 = off
+    std::vector<int32_t> expert_cache_layers;               // slots per layer, one entry per layer
+    int32_t              expert_cache_threads      = 4;     // I/O threads
+    int32_t              expert_prefetch_k         = 0;     // experts prefetched per layer, 0 = demand only
+    int32_t              expert_prefetch_half_life = 1;     // the predictor's count half-life in tokens
+    float                expert_prefetch_mix       = 0.75f; // the weight of its transitions against its counts
+    std::string          expert_cache_stats;                // JSON counters, written when the model is freed
+    llama_expert_cache_params expert_cache_lp = {};         // what common_model_params_to_llama hands to the model
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
