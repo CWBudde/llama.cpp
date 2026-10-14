@@ -94,6 +94,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_expert_cache;
 
 //
 // llm_graph_input
@@ -1031,6 +1032,9 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     const llama_prec_policy * prec_policy;
+
+    // [EXPERIMENTAL] the model's expert cache, set by the archs that read their experts from it
+    llama_expert_cache * expert_cache = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

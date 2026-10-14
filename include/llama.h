@@ -316,6 +316,20 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    // [EXPERIMENTAL] bounded cache of routed experts (Kolibri only): the stacked expert tensors stay
+    // in the file, and each layer keeps at most n_slots of its experts in device memory, read on
+    // demand with pread and, optionally, prefetched by a causal predictor
+    struct llama_expert_cache_params {
+        int32_t         n_slots;       // experts per layer, 0 = cache off
+        const int32_t * n_slots_layer; // optional: experts per layer, n_layer entries (overrides n_slots)
+        int32_t         n_layer_slots; // number of entries in n_slots_layer
+        int32_t         n_threads;     // I/O threads
+        int32_t         prefetch_k;    // experts the predictor prefetches per layer, 0 = demand only
+        int32_t         prefetch_half_life; // the predictor's count half-life in tokens
+        float           prefetch_mix;  // the weight of its transitions against its counts, in [0, 1]
+        const char *    stats_path;    // optional: write the cache counters as JSON when the model is freed
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -345,6 +359,9 @@ extern "C" {
 
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
+
+        // [EXPERIMENTAL] bounded expert cache, NULL = off
+        const struct llama_expert_cache_params * expert_cache;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -478,6 +495,7 @@ extern "C" {
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
     LLAMA_API struct llama_model_params          llama_model_default_params(void);
     LLAMA_API struct llama_context_params        llama_context_default_params(void);
+    LLAMA_API struct llama_expert_cache_params   llama_expert_cache_default_params(void);
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 
