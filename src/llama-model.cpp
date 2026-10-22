@@ -1351,8 +1351,10 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 llama_model::~llama_model() {
     // the cache's I/O threads go before anything they could touch; it writes its stats, with the
     // decode timing
+    // the cache writes the stats itself; params.expert_cache is borrowed and may be gone by now
+    const bool cache_writes = expert_cache != nullptr;
     expert_cache.reset();
-    if (decode_diag && !expert_cache_requested()) {
+    if (decode_diag && !cache_writes) {
         decode_diag->write();
     }
 

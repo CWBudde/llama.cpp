@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -26,8 +27,13 @@ struct llama_decode_diag {
     uint64_t tokens        = 0; // decode ubatches, one token each
     double   wall_seconds  = 0; // their wall time: graph build or reuse, compute and the output copy, synchronized
     uint64_t splits        = 0; // the scheduler's graph splits, summed over them
-    uint64_t metal_commits = 0; // Metal command buffers committed during them
+    uint64_t metal_commits = 0; // Metal command buffers committed during them (process-wide, so with
+                                // concurrent contexts also those of the others)
     bool     has_metal     = false; // whether a Metal backend counts its commits (else metal_commits is null)
+
+    // contexts of one model decode concurrently: they update the fields above only through these
+    void set_metal(bool has);
+    void add(double seconds, uint64_t n_splits, uint64_t n_commits);
 
     // the fields above as JSON members, without braces
     std::string json_fields() const;
@@ -40,6 +46,8 @@ struct llama_decode_diag {
     void write() const;
 
 private:
+    mutable std::mutex mtx;
+
     uint64_t disk_read0 = 0;
     uint64_t pageins0   = 0;
     uint64_t faults0    = 0;

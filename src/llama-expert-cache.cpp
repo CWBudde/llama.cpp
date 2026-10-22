@@ -123,7 +123,21 @@ std::string process_json(const process_counts & pc, uint64_t disk_read0, uint64_
 
 } // namespace
 
+void llama_decode_diag::set_metal(bool has) {
+    std::lock_guard<std::mutex> lock(mtx);
+    has_metal = has;
+}
+
+void llama_decode_diag::add(double seconds, uint64_t n_splits, uint64_t n_commits) {
+    std::lock_guard<std::mutex> lock(mtx);
+    tokens++;
+    wall_seconds  += seconds;
+    splits        += n_splits;
+    metal_commits += n_commits;
+}
+
 std::string llama_decode_diag::json_fields() const {
+    std::lock_guard<std::mutex> lock(mtx);
     return format("\"tokens\": %llu, \"wall_seconds\": %.6f, \"splits\": %llu, \"metal_commits\": %s",
         (unsigned long long) tokens, wall_seconds, (unsigned long long) splits, json_u64(has_metal, metal_commits).c_str());
 }
