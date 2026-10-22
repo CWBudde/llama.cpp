@@ -318,6 +318,11 @@ void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t 
 void ggml_metal_event_encode_wait  (ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf);
 
 ggml_metal_device_t ggml_metal_device_init(int device, int n_devices);
+
+// diagnostics: command buffers committed by the contexts and buffers of this process, counted at
+// every commit except the residency sets' keep-alive work
+void     ggml_metal_count_commit(void);
+uint64_t ggml_metal_get_n_commits(void);
 void ggml_metal_device_free(ggml_metal_device_t dev);
 
 ggml_metal_device_t ggml_metal_device_get(int device, int n_devices);

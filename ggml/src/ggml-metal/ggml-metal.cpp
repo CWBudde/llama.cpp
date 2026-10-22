@@ -667,6 +667,10 @@ void ggml_backend_metal_capture_next_compute(ggml_backend_t backend) {
     ggml_metal_capture_next_compute(ctx);
 }
 
+uint64_t ggml_backend_metal_get_n_commits(void) {
+    return ggml_metal_get_n_commits();
+}
+
 // backend device
 
 static const char * ggml_backend_metal_device_get_name(ggml_backend_dev_t dev) {
@@ -949,6 +953,9 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_metal_get_n_commits") == 0) {
+        return (void *)ggml_backend_metal_get_n_commits;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;

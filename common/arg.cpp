@@ -2831,11 +2831,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--expert-cache-stats"}, "FNAME",
-        "[EXPERIMENTAL] write the expert cache's counters as JSON to FNAME when the model is freed",
+        "[EXPERIMENTAL] write the expert cache's counters and the decode timing as JSON to FNAME when the model is freed (without --expert-cache: the decode timing only)",
         [](common_params & params, const std::string & value) {
             params.expert_cache_stats = value;
         }
     ));
+    add_opt(common_arg(
+        {"--expert-cache-buffered"},
+        "[EXPERIMENTAL] read the expert cache's misses through the page cache instead of bypassing it (macOS: no F_NOCACHE)",
+        [](common_params & params) {
+            params.expert_cache_buffered = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_BUFFERED"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",

@@ -328,7 +328,9 @@ extern "C" {
         int32_t         prefetch_k;    // experts the predictor prefetches per layer, 0 = demand only
         int32_t         prefetch_half_life; // the predictor's count half-life in tokens
         float           prefetch_mix;  // the weight of its transitions against its counts, in [0, 1]
-        const char *    stats_path;    // optional: write the cache counters as JSON when the model is freed
+        const char *    stats_path;    // optional: write the cache counters as JSON when the model is freed;
+                                       // with n_slots 0 and no n_slots_layer, the decode timing of the resident model
+        bool            buffered;      // read misses through the page cache (macOS: no F_NOCACHE)
     };
 
     struct llama_model_params {

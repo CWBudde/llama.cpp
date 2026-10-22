@@ -705,6 +705,7 @@ struct llama_hadamard {
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
 };
 struct llama_expert_cache;
+struct llama_decode_diag;
 
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
@@ -856,6 +857,9 @@ struct llama_model {
     // [EXPERIMENTAL] bounded cache of routed experts, when llama_model_params.expert_cache asks for one
     std::unique_ptr<llama_expert_cache> expert_cache;
     bool expert_cache_requested() const;
+
+    // [EXPERIMENTAL] the decode timing, when the expert cache params ask for stats (with or without the cache)
+    std::unique_ptr<llama_decode_diag> decode_diag;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

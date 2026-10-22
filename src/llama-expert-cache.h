@@ -5,7 +5,7 @@
 // The stacked expert tensors of every layer stay in the GGUF: they are mapped, but never touched.
 // Each layer instead has slot tensors of n_slots experts in device memory. Before the expert
 // matmuls of a ubatch, a CPU op maps the router's ids to slots, reading every expert that is not in
-// a slot with pread (F_NOCACHE on macOS, so the bytes do not stay in the page cache); the matmuls
+// a slot with pread (F_NOCACHE on macOS unless buffered, so the bytes do not stay in the page cache); the matmuls
 // then read the slots. The router chooses every expert: the expert weights keep its own ids, and a
 // prediction only ever decides what to read ahead.
 
@@ -19,6 +19,31 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+// [EXPERIMENTAL] the decode timing that --expert-cache-stats reports, with or without the cache:
+// the context adds every ubatch of one token
+struct llama_decode_diag {
+    uint64_t tokens        = 0; // decode ubatches, one token each
+    double   wall_seconds  = 0; // their wall time: graph build or reuse, compute and the output copy, synchronized
+    uint64_t splits        = 0; // the scheduler's graph splits, summed over them
+    uint64_t metal_commits = 0; // Metal command buffers committed during them
+    bool     has_metal     = false; // whether a Metal backend counts its commits (else metal_commits is null)
+
+    // the fields above as JSON members, without braces
+    std::string json_fields() const;
+
+    // the stats of a model without the cache: the decode timing and the process counters
+    // since start(); write() puts them into path, when the model is freed
+    std::string path;
+    void start();
+    std::string stats_json() const;
+    void write() const;
+
+private:
+    uint64_t disk_read0 = 0;
+    uint64_t pageins0   = 0;
+    uint64_t faults0    = 0;
+};
 
 struct llama_expert_cache {
     // the gate, up and down tensors of one layer, with their data offsets in the file
@@ -60,6 +85,9 @@ struct llama_expert_cache {
     // the remap op's work
     void remap(int il, const ggml_tensor * ids, ggml_tensor * dst);
 
+    // the decode timing to add to the stats; the model owns it
+    void set_decode_diag(const llama_decode_diag * d) { diag = d; }
+
     std::string stats_json() const;
 
 private:
@@ -72,6 +100,7 @@ private:
     int    prefetch_half_life;
     double prefetch_mix;
     std::string stats_path;
+    bool buffered; // misses read through the page cache
 
     std::vector<tensors>  stacked;
     std::vector<tensors>  slot_t; // the slot tensors; offs unused
@@ -100,6 +129,11 @@ private:
     int64_t tok_first = 0; // the first token of the ubatch being computed
     int64_t tok_next  = 0;
     bool    decode    = false;
+
+    // the remap op's time per phase, prefill and decode; minus the wait on loads, it is the
+    // bookkeeping's own cost (remap_seconds in the stats)
+    double op_seconds[2] = {0, 0};
+    const llama_decode_diag * diag = nullptr;
 
     // process counters at init, for the deltas in the stats
     uint64_t disk_read0 = 0;
