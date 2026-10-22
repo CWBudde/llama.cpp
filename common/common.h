@@ -538,7 +538,8 @@ struct common_params {
     int32_t              expert_prefetch_k         = 0;     // experts prefetched per layer, 0 = demand only
     int32_t              expert_prefetch_half_life = 1;     // the predictor's count half-life in tokens
     float                expert_prefetch_mix       = 0.75f; // the weight of its transitions against its counts
-    std::string          expert_cache_stats;                // JSON counters, written when the model is freed
+    std::string          expert_cache_stats;                // JSON counters, written when the model is freed (also without the cache: decode timing)
+    bool                 expert_cache_buffered     = false; // read misses through the page cache
     llama_expert_cache_params expert_cache_lp = {};         // what common_model_params_to_llama hands to the model
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)

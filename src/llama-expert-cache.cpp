@@ -5,6 +5,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <fstream>
@@ -97,29 +98,77 @@ void remap_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
     ud->cache->remap(ud->il, dst->src[0], dst);
 }
 
-std::string counts_json(const llama_expert_cache_counts & c) {
+// extra: further members, each with a leading ", "
+std::string counts_json(const llama_expert_cache_counts & c, const std::string & extra) {
     return format(
         "{\"steps\": %llu, \"needed\": %llu, \"hits\": %llu, \"hits_loading\": %llu, \"misses\": %llu, "
         "\"evictions\": %llu, \"demand_bytes\": %llu, \"prefetch_bytes\": %llu, \"prefetch_issued\": %llu, "
         "\"prefetch_used\": %llu, \"prefetch_wasted\": %llu, \"prefetch_cancelled\": %llu, "
         "\"prefetch_skipped\": %llu, \"load_failures\": %llu, \"wait_seconds\": %.6f, \"io_seconds\": %.6f, "
-        "\"io_prefetch_seconds\": %.6f}",
+        "\"io_prefetch_seconds\": %.6f%s}",
         (unsigned long long) c.steps, (unsigned long long) c.needed, (unsigned long long) c.hits,
         (unsigned long long) c.hits_loading, (unsigned long long) c.misses, (unsigned long long) c.evictions,
         (unsigned long long) c.demand_bytes, (unsigned long long) c.prefetch_bytes,
         (unsigned long long) c.prefetch_issued, (unsigned long long) c.prefetch_used,
         (unsigned long long) c.prefetch_wasted, (unsigned long long) c.prefetch_cancelled,
         (unsigned long long) c.prefetch_skipped, (unsigned long long) c.load_failures, c.wait_seconds, c.io_seconds,
-        c.io_prefetch_seconds);
+        c.io_prefetch_seconds, extra.c_str());
+}
+
+std::string process_json(const process_counts & pc, uint64_t disk_read0, uint64_t pageins0, uint64_t faults0) {
+    return format("{\"disk_bytes_read\": %s, \"pageins\": %s, \"major_faults\": %s, \"max_phys_footprint\": %s}",
+        json_u64(pc.has_io, pc.disk_read - disk_read0).c_str(), json_u64(pc.has_io, pc.pageins - pageins0).c_str(),
+        json_u64(pc.has_faults, pc.faults - faults0).c_str(), json_u64(pc.has_io, pc.max_phys_footprint).c_str());
 }
 
 } // namespace
+
+void llama_decode_diag::set_metal(bool has) {
+    std::lock_guard<std::mutex> lock(mtx);
+    has_metal = has;
+}
+
+void llama_decode_diag::add(double seconds, uint64_t n_splits, uint64_t n_commits) {
+    std::lock_guard<std::mutex> lock(mtx);
+    tokens++;
+    wall_seconds  += seconds;
+    splits        += n_splits;
+    metal_commits += n_commits;
+}
+
+std::string llama_decode_diag::json_fields() const {
+    std::lock_guard<std::mutex> lock(mtx);
+    return format("\"tokens\": %llu, \"wall_seconds\": %.6f, \"splits\": %llu, \"metal_commits\": %s",
+        (unsigned long long) tokens, wall_seconds, (unsigned long long) splits, json_u64(has_metal, metal_commits).c_str());
+}
+
+void llama_decode_diag::start() {
+    const auto pc = process_now();
+    disk_read0 = pc.disk_read;
+    pageins0   = pc.pageins;
+    faults0    = pc.faults;
+}
+
+void llama_decode_diag::write() const {
+    const std::string stats = stats_json();
+    LLAMA_LOG_INFO("%s: %s\n", __func__, stats.c_str());
+    std::ofstream out(path);
+    out << stats << "\n";
+    if (!out) {
+        LLAMA_LOG_ERROR("%s: cannot write %s\n", __func__, path.c_str());
+    }
+}
+
+std::string llama_decode_diag::stats_json() const {
+    return format("{\"expert_cache\": null, \"decode\": {%s}, \"process\": %s}",
+        json_fields().c_str(), process_json(process_now(), disk_read0, pageins0, faults0).c_str());
+}
 
 llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int n_layer, int n_expert, int n_expert_used)
     : n_layer(n_layer), n_expert(n_expert), n_expert_used(n_expert_used),
       n_threads(std::max(p.n_threads, 1)), prefetch_k(std::max(p.prefetch_k, 0)),
       prefetch_half_life(std::max(p.prefetch_half_life, 1)), prefetch_mix(p.prefetch_mix),
-      stats_path(p.stats_path ? p.stats_path : "") {
+      stats_path(p.stats_path ? p.stats_path : ""), buffered(p.buffered) {
     if (p.n_slots_layer && p.n_layer_slots > 0) {
         if (p.n_layer_slots != n_layer) {
             throw std::runtime_error(format("expert cache: %d per-layer slot counts for %d layers", p.n_layer_slots, n_layer));
@@ -287,9 +336,12 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
     if (fd < 0) {
         throw std::runtime_error(format("expert cache: open %s: %s", p, strerror(errno)));
     }
-    // reads go to the device, not through the page cache
-    fcntl(fd, F_NOCACHE, 1);
+    // reads go to the device, not through the page cache, unless asked to be buffered
+    if (!buffered) {
+        fcntl(fd, F_NOCACHE, 1);
+    }
 #elif defined(__linux__)
+    buffered = true; // no page-cache bypass here
     path = format("/proc/self/fd/%d", fd_loader);
     fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
@@ -322,9 +374,9 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
     for (const auto & gr : groups) {
         where += format("%s%.2f MiB for %s", where.empty() ? "" : ", ", ggml_backend_buffer_get_size(gr.buf)/1024.0/1024.0, ggml_backend_dev_name(gr.dev));
     }
-    LLAMA_LOG_INFO("%s: %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, reading %s\n",
+    LLAMA_LOG_INFO("%s: %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, reading %s%s\n",
         __func__, *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
-        n_expert, where.c_str(), n_threads, pf.c_str(), path.c_str());
+        n_expert, where.c_str(), n_threads, pf.c_str(), path.c_str(), buffered ? " (buffered)" : "");
 }
 
 uint32_t llama_expert_cache::max_ubatch() const {
@@ -350,6 +402,7 @@ ggml_tensor * llama_expert_cache::build_remap(ggml_context * ctx0, ggml_tensor *
 
 void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
+    const auto t0 = std::chrono::steady_clock::now();
     const int n_tokens = (int) ids->ne[1];
 
     // a graph runs its layers in order; layer 0 starts the next ubatch (the last layer may see
@@ -378,6 +431,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
             slots->prefetch(target, pred.data(), (int) pred.size(), decode);
         }
     }
+    op_seconds[decode] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
 bool llama_expert_cache::load(int il, int e, int s) {
@@ -414,14 +468,18 @@ std::string llama_expert_cache::stats_json() const {
     const auto pc = process_now();
     const int s_min = *std::min_element(n_slots.begin(), n_slots.end());
     const int s_max = *std::max_element(n_slots.begin(), n_slots.end());
+    const auto c_pre = slots->counts(false);
+    const auto c_dec = slots->counts(true);
+    // the remap op's own time: all of it but the wait on loads
+    const auto remap = [](double op, double wait) { return format(", \"remap_seconds\": %.6f", std::max(op - wait, 0.0)); };
+    const std::string x_pre = remap(op_seconds[0], c_pre.wait_seconds);
+    const std::string x_dec = remap(op_seconds[1], c_dec.wait_seconds) + (diag ? ", " + diag->json_fields() : std::string());
     return format(
         "{\"expert_cache\": {\"slots_min\": %d, \"slots_max\": %d, \"slot_bytes\": %zu, \"expert_bytes\": %zu, "
-        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"file\": %s}, "
-        "\"prefill\": %s, \"decode\": %s, "
-        "\"process\": {\"disk_bytes_read\": %s, \"pageins\": %s, \"major_faults\": %s, \"max_phys_footprint\": %s}}",
+        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"buffered\": %s, \"file\": %s}, "
+        "\"prefill\": %s, \"decode\": %s, \"process\": %s}",
         s_min, s_max, slot_bytes(), expert_bytes.empty() ? (size_t) 0 : expert_bytes[0],
-        n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, json_string(path).c_str(),
-        counts_json(slots->counts(false)).c_str(), counts_json(slots->counts(true)).c_str(),
-        json_u64(pc.has_io, pc.disk_read - disk_read0).c_str(), json_u64(pc.has_io, pc.pageins - pageins0).c_str(),
-        json_u64(pc.has_faults, pc.faults - faults0).c_str(), json_u64(pc.has_io, pc.max_phys_footprint).c_str());
+        n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, buffered ? "true" : "false", json_string(path).c_str(),
+        counts_json(c_pre, x_pre).c_str(), counts_json(c_dec, x_dec).c_str(),
+        process_json(pc, disk_read0, pageins0, faults0).c_str());
 }

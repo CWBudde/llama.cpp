@@ -1291,8 +1291,14 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
-    // the cache's I/O threads go before anything they could touch
+    // the cache's I/O threads go before anything they could touch; it writes its stats, with the
+    // decode timing
+    // the cache writes the stats itself; params.expert_cache is borrowed and may be gone by now
+    const bool cache_writes = expert_cache != nullptr;
     expert_cache.reset();
+    if (decode_diag && !cache_writes) {
+        decode_diag->write();
+    }
 
     for (auto * lora : loras) {
         delete lora;
@@ -2022,6 +2028,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             devs[il] = pimpl->dev_layer.at(il).dev;
         }
         expert_cache->init(stacked, devs, fd);
+    }
+
+    // [EXPERIMENTAL] stats asked for: the context adds the decode timing, also without the cache
+    if (params.expert_cache && params.expert_cache->stats_path && *params.expert_cache->stats_path) {
+        decode_diag = std::make_unique<llama_decode_diag>();
+        decode_diag->path = params.expert_cache->stats_path;
+        decode_diag->start();
+        if (expert_cache) {
+            expert_cache->set_decode_diag(decode_diag.get());
+        }
     }
 
     return true;
@@ -3022,6 +3038,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
         /*.prefetch_half_life =*/ 1,
         /*.prefetch_mix       =*/ 0.75f,
         /*.stats_path         =*/ nullptr,
+        /*.buffered           =*/ false,
     };
 
     return result;

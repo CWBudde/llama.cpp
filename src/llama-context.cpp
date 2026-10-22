@@ -493,6 +493,14 @@ llama_context::llama_context(
         }
     }
 
+    // [EXPERIMENTAL] decode timing: the Metal backend counts its command buffers, if it is there
+    if (model.decode_diag) {
+        if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL")) {
+            metal_n_commits = (uint64_t (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_get_n_commits");
+        }
+        model.decode_diag->set_metal(metal_n_commits != nullptr);
+    }
+
     // [EXPERIMENTAL] the expert cache serves one context; taken last, so that a constructor that
     // throws before never holds it (its destructor would not run to give it back)
     if (model.expert_cache) {
@@ -1915,6 +1923,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        // [EXPERIMENTAL] decode timing for --expert-cache-stats: a ubatch of one token, from the
+        // graph's build or reuse to its outputs' copy
+        const bool    diag      = model.decode_diag && ubatch.n_tokens == 1;
+        const int64_t diag_t0   = diag ? ggml_time_us() : 0;
+        const uint64_t diag_c0  = diag && metal_n_commits ? metal_n_commits() : 0;
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
@@ -2074,6 +2088,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+        }
+
+        if (diag) {
+            // the outputs are read right after anyway; waiting here closes the measurement
+            ggml_backend_sched_synchronize(sched.get());
+            model.decode_diag->add((ggml_time_us() - diag_t0)/1e6, ggml_backend_sched_get_n_splits(sched.get()),
+                metal_n_commits ? metal_n_commits() - diag_c0 : 0);
         }
 
         n_outputs_prev += n_outputs;

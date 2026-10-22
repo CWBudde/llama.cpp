@@ -1672,7 +1672,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
 
-    if (params.expert_cache > 0 || !params.expert_cache_layers.empty()) {
+    // without the cache, --expert-cache-stats still asks for the decode timing of the resident model
+    if (params.expert_cache > 0 || !params.expert_cache_layers.empty() || !params.expert_cache_stats.empty()) {
         auto & ec = params.expert_cache_lp;
         ec = llama_expert_cache_default_params();
         ec.n_slots            = params.expert_cache;
@@ -1683,6 +1684,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         ec.prefetch_half_life = params.expert_prefetch_half_life;
         ec.prefetch_mix       = params.expert_prefetch_mix;
         ec.stats_path         = params.expert_cache_stats.empty() ? nullptr : params.expert_cache_stats.c_str();
+        ec.buffered           = params.expert_cache_buffered;
         mparams.expert_cache  = &ec;
     }
 
