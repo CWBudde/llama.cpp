@@ -354,6 +354,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 
         [encoder endEncoding];
         [cmd_buf commit];
+        ggml_metal_count_commit();
 
         [ctx->buf_refs addObject:buf_src];
         [buf_src release];
@@ -400,6 +401,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
         [encoder endEncoding];
         [cmd_buf commit];
+        ggml_metal_count_commit();
 
         [ctx->buf_refs addObject:buf_dst];
         [buf_dst release];
@@ -430,6 +432,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
         ggml_metal_event_encode_signal(ctx_dst->ev_sync, sync_cmd_buf);
 
         [sync_cmd_buf commit];
+        ggml_metal_count_commit();
 
         [ctx_dst->cmd_bufs_ext addObject:sync_cmd_buf];
         ctx_dst->cmd_buf_last = sync_cmd_buf;
@@ -455,6 +458,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
         ggml_metal_event_encode_signal(ev_cpy, cmd_buf);
 
         [cmd_buf commit];
+        ggml_metal_count_commit();
 
         // do not wait here for completion
         //[cmd_buf waitUntilCompleted];
@@ -647,6 +651,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 }
 
                 [next_buffer commit];
+                ggml_metal_count_commit();
             }
 
             [ctx->capture_scope endScope];
@@ -677,6 +682,7 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
         ggml_metal_event_encode_signal(ev, cmd_buf);
 
         [cmd_buf commit];
+        ggml_metal_count_commit();
 
         [ctx->cmd_bufs_ext addObject:cmd_buf];
         ctx->cmd_buf_last = cmd_buf;
@@ -693,6 +699,7 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
         ggml_metal_event_encode_wait(ev, cmd_buf);
 
         [cmd_buf commit];
+        ggml_metal_count_commit();
 
         [ctx->cmd_bufs_ext addObject:cmd_buf];
         ctx->cmd_buf_last = cmd_buf;
@@ -767,6 +774,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];
+            ggml_metal_count_commit();
         }
     });
 }

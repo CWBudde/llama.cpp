@@ -940,6 +940,16 @@ struct ggml_metal_rsets {
     dispatch_group_t d_group;
 };
 
+static atomic_uint_fast64_t g_metal_n_commits = 0;
+
+void ggml_metal_count_commit(void) {
+    atomic_fetch_add_explicit(&g_metal_n_commits, 1, memory_order_relaxed);
+}
+
+uint64_t ggml_metal_get_n_commits(void) {
+    return (uint64_t) atomic_load_explicit(&g_metal_n_commits, memory_order_relaxed);
+}
+
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
 static void ggml_metal_dummy_work(ggml_metal_device_t dev) {
     if (dev->mtl_queue == nil) {
@@ -2323,6 +2333,7 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
         }
 
         [cmd_buf commit];
+        ggml_metal_count_commit();
         [cmd_buf waitUntilCompleted];
     }
 }
@@ -2373,6 +2384,7 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         }];
 
         [cmd_buf commit];
+        ggml_metal_count_commit();
 
         dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
         dispatch_release(completion_semaphore);
@@ -2417,6 +2429,7 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         }
 
         [cmd_buf commit];
+        ggml_metal_count_commit();
         [cmd_buf waitUntilCompleted];
 
         [buf_dst release];
@@ -2458,6 +2471,7 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
         }
 
         [cmd_buf commit];
+        ggml_metal_count_commit();
         [cmd_buf waitUntilCompleted];
     }
 
@@ -2484,6 +2498,7 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
         }
 
         [cmd_buf commit];
+        ggml_metal_count_commit();
         [cmd_buf waitUntilCompleted];
     }
 }
