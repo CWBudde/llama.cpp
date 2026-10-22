@@ -498,6 +498,7 @@ llama_context::llama_context(
         if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL")) {
             metal_n_commits = (uint64_t (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_get_n_commits");
         }
+        model.decode_diag->set_metal(metal_n_commits != nullptr);
     }
 
     // [EXPERIMENTAL] the expert cache serves one context; taken last, so that a constructor that
@@ -2092,12 +2093,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (diag) {
             // the outputs are read right after anyway; waiting here closes the measurement
             ggml_backend_sched_synchronize(sched.get());
-            auto & d = *model.decode_diag;
-            d.tokens++;
-            d.wall_seconds  += (ggml_time_us() - diag_t0)/1e6;
-            d.splits        += ggml_backend_sched_get_n_splits(sched.get());
-            d.has_metal      = metal_n_commits != nullptr;
-            d.metal_commits += metal_n_commits ? metal_n_commits() - diag_c0 : 0;
+            model.decode_diag->add((ggml_time_us() - diag_t0)/1e6, ggml_backend_sched_get_n_splits(sched.get()),
+                metal_n_commits ? metal_n_commits() - diag_c0 : 0);
         }
 
         n_outputs_prev += n_outputs;
