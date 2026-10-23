@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-expert-cache.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -343,6 +344,19 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // [EXPERIMENTAL] with the expert cache, the experts of every ubatch must fit its slots
+    if (model.expert_cache) {
+        // refused early, before buffers are allocated; attach() below decides
+        if (model.expert_cache->in_use()) {
+            throw std::runtime_error("the expert cache serves one context per model, and it has one");
+        }
+        const uint32_t cap = model.expert_cache->max_ubatch();
+        if (cparams.n_ubatch > cap) {
+            LLAMA_LOG_WARN("%s: n_ubatch %u capped to %u, so that a ubatch's experts fit the expert cache\n", __func__, cparams.n_ubatch, cap);
+            cparams.n_ubatch = cap;
+        }
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
@@ -580,11 +594,32 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // [EXPERIMENTAL] decode timing: the Metal backend counts its command buffers, if it is there
+    if (model.decode_diag) {
+        if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL")) {
+            metal_n_commits = (uint64_t (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_get_n_commits");
+        }
+        model.decode_diag->set_metal(metal_n_commits != nullptr);
+    }
+
+    // [EXPERIMENTAL] the expert cache serves one context; taken last, so that a constructor that
+    // throws before never holds it (its destructor would not run to give it back)
+    if (model.expert_cache) {
+        if (!model.expert_cache->attach()) {
+            throw std::runtime_error("the expert cache serves one context per model, and it has one");
+        }
+        expert_cache_attached = true;
+    }
 }
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (expert_cache_attached) {
+        model.expert_cache->detach();
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -2015,6 +2050,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        // [EXPERIMENTAL] decode timing for --expert-cache-stats: a ubatch of one token, from the
+        // graph's build or reuse to its outputs' copy
+        const bool    diag      = model.decode_diag && ubatch.n_tokens == 1;
+        const int64_t diag_t0   = diag ? ggml_time_us() : 0;
+        const uint64_t diag_c0  = diag && metal_n_commits ? metal_n_commits() : 0;
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
@@ -2174,6 +2215,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+        }
+
+        if (diag) {
+            // the outputs are read right after anyway; waiting here closes the measurement
+            ggml_backend_sched_synchronize(sched.get());
+            model.decode_diag->add((ggml_time_us() - diag_t0)/1e6, ggml_backend_sched_get_n_splits(sched.get()),
+                metal_n_commits ? metal_n_commits() - diag_c0 : 0);
         }
 
         n_outputs_prev += n_outputs;

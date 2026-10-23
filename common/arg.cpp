@@ -29,6 +29,7 @@
 #include <cstdarg>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <list>
 #include <numeric>
 #include <regex>
@@ -2767,6 +2768,81 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
+    add_opt(common_arg(
+        {"--expert-cache"}, "N",
+        "[EXPERIMENTAL] keep at most N routed experts per layer in device memory and read the others from the model file on demand (Kolibri only; caps the ubatch at N / experts per token)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE"));
+    add_opt(common_arg(
+        {"--expert-cache-layers"}, "FNAME",
+        "[EXPERIMENTAL] the expert cache's slots per layer: a file of one integer per layer, separated by commas or white space",
+        [](common_params & params, const std::string & value) {
+            std::ifstream in(value);
+            if (!in) {
+                throw std::invalid_argument("cannot read " + value);
+            }
+            params.expert_cache_layers.clear();
+            std::string tok;
+            while (in >> tok) {
+                std::stringstream ss(tok);
+                std::string part;
+                while (std::getline(ss, part, ',')) {
+                    if (!part.empty()) {
+                        params.expert_cache_layers.push_back(std::stoi(part));
+                    }
+                }
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-cache-threads"}, "N",
+        string_format("[EXPERIMENTAL] the expert cache's I/O threads (default: %d)", params.expert_cache_threads),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache_threads = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-prefetch"}, "K[,HALF_LIFE[,MIX]]",
+        "[EXPERIMENTAL] prefetch the K experts per layer that a decayed-count Markov predictor ranks best, two layers ahead within a token (default: 0, demand only; half-life 1 token, mix 0.75)",
+        [](common_params & params, const std::string & value) {
+            const auto parts = string_split<std::string>(value, ',');
+            if (parts.empty() || parts.size() > 3) {
+                throw std::invalid_argument("want K[,HALF_LIFE[,MIX]]");
+            }
+            params.expert_prefetch_k = std::stoi(parts[0]);
+            if (parts.size() > 1) {
+                params.expert_prefetch_half_life = std::stoi(parts[1]);
+            }
+            if (parts.size() > 2) {
+                params.expert_prefetch_mix = std::stof(parts[2]);
+            }
+            if (params.expert_prefetch_k < 0 || params.expert_prefetch_half_life < 1 || params.expert_prefetch_mix < 0 || params.expert_prefetch_mix > 1) {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-cache-stats"}, "FNAME",
+        "[EXPERIMENTAL] write the expert cache's counters and the decode timing as JSON to FNAME when the model is freed (without --expert-cache: the decode timing only)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_stats = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-cache-buffered"},
+        "[EXPERIMENTAL] read the expert cache's misses through the page cache instead of bypassing it (macOS: no F_NOCACHE)",
+        [](common_params & params) {
+            params.expert_cache_buffered = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_BUFFERED"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",

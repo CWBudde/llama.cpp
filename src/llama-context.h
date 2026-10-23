@@ -425,6 +425,12 @@ private:
 
     bool has_evaluated_once = false;
 
+    // this context holds the model's expert cache
+    bool expert_cache_attached = false;
+
+    // [EXPERIMENTAL] the Metal backend's command buffer count, for the decode timing (nullptr: none)
+    uint64_t (*metal_n_commits)(void) = nullptr;
+
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 

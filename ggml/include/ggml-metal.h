@@ -54,6 +54,10 @@ GGML_BACKEND_API bool ggml_backend_metal_supports_family(ggml_backend_t backend,
 // capture all command buffers committed the next time `ggml_backend_graph_compute` is called
 GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t backend);
 
+// diagnostics: the Metal command buffers this process has committed so far (all devices, keep-alive
+// work excluded); also reachable through the registry as "ggml_backend_metal_get_n_commits"
+GGML_BACKEND_API uint64_t ggml_backend_metal_get_n_commits(void);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
 #ifdef __cplusplus
