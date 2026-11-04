@@ -1722,6 +1722,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         ec.prefetch_mix       = params.expert_prefetch_mix;
         ec.stats_path         = params.expert_cache_stats.empty() ? nullptr : params.expert_cache_stats.c_str();
         ec.buffered           = params.expert_cache_buffered;
+        ec.waves              = params.expert_cache_waves;
         mparams.expert_cache  = &ec;
     }
 

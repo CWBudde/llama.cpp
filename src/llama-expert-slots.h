@@ -33,7 +33,13 @@ struct llama_expert_cache_counts {
     double   io_seconds   = 0; // the loads' own durations, summed over the I/O threads
     double   io_prefetch_seconds = 0; // the part of io_seconds that prefetches took: overlapped with
                                       // compute, unless a remap awaited the prefetch (hits_loading)
+    uint64_t waves       = 0; // waves staged with experts of their own (prefill ubatches above the slots)
+    uint64_t wave_parked = 0; // pairs of other waves parked on a slot of the staged wave, masked to 0
 };
+
+// the experts per wave for a layer of n_slots slots and k experts per token: a wave, the next
+// one's preloads and up to k parking slots must fit at once, so 0 (no waves) below 3k slots
+int llama_expert_wave_cap(int n_slots, int k);
 
 struct llama_expert_slots {
     // load(layer, expert, slot) reads one expert into one slot and returns false on failure
@@ -52,11 +58,32 @@ struct llama_expert_slots {
     // id is out of range, and false after a demand load failed.
     bool remap(int l, const int32_t * ids, int n, bool decode, int32_t * out);
 
+    // Waves run a ubatch that needs more distinct experts than a layer has slots in passes over
+    // its union of experts. plan_waves cuts the union of layer l's n ids (rows of k per token) into
+    // waves of at most cap experts, the least used first, so the most used are what the slots
+    // hold afterwards; first use breaks ties. It returns the number of waves, or -1 for an id out
+    // of range or a cap below k.
+    int plan_waves(int l, const int32_t * ids, int n, int k, int cap);
+
+    // stage_wave loads wave w of layer l's plan, queues the next wave's loads behind it and waits
+    // for wave w. out gets the slot of each id of wave w; every other id gets a slot of a ready
+    // expert, distinct within its row of k, for the masked GEMM. The slots out names and the
+    // experts of wave w stay put until the next stage of the layer, so the GEMMs may read them
+    // until then. A wave beyond the plan (the graph is built for the worst case) parks every id.
+    // It returns false after a demand load failed.
+    bool stage_wave(int l, int w, const int32_t * ids, int n, int k, int32_t * out);
+
+    // wave_mask sets mask[i] to 1 if ids[i] is in wave w of layer l's plan, else to 0
+    void wave_mask(int l, int w, const int32_t * ids, int n, float * mask) const;
+
+    // the wave of expert e in layer l's plan, or -1
+    int wave_of(int l, int e) const;
+
     // prefetch queues loads of the experts of layer l that are neither ready nor loading, best
     // first, into its least recently used slots. Nothing is queued for the layer in flight.
     void prefetch(int l, const int * experts, int n, bool decode);
 
-    // distinct experts of the last remap, in the order the ids met them
+    // distinct experts of the last remap or wave plan, in the order the ids met them
     const std::vector<int> & last_needed() const { return needed; }
 
     int n_slots(int l) const { return (int) layers[l].slots.size(); }
@@ -89,13 +116,18 @@ private:
     struct layer {
         std::vector<slot> slots;
         std::vector<int>  where; // per expert: its slot, or -1
+        std::vector<int>  wave;      // per expert: its wave in the plan, or -1
+        std::vector<char> preloaded; // per expert: loaded ahead by the previous stage, counted there
+        std::vector<std::vector<int>> plan; // the experts of each wave
     };
 
     struct job {
         int l, slot;
     };
 
-    int pick_victim(int l) const;
+    int pick_victim(int l, int w_now = -1) const;
+    void drop_prefetches(int l);
+    int  take_victim(int l, std::unique_lock<std::mutex> & lock, llama_expert_cache_counts & c, bool wait, int w_now = -1);
     void assign(int l, int s, int e, bool demand, bool decode);
     void worker();
     llama_expert_cache_counts & counts_of(bool decode) { return decode ? c_decode : c_prefill; }

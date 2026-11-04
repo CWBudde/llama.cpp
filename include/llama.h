@@ -331,6 +331,8 @@ extern "C" {
         const char *    stats_path;    // optional: write the cache counters as JSON when the model is freed;
                                        // with n_slots 0 and no n_slots_layer, the decode timing of the resident model
         bool            buffered;      // read misses through the page cache (macOS: no F_NOCACHE)
+        bool            waves;         // a ubatch with more experts than the slots runs its expert matmuls in
+                                       // waves of experts instead of being capped (needs 3*n_expert_used slots)
     };
 
     struct llama_model_params {

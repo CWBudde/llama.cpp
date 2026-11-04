@@ -12,6 +12,8 @@ llama_expert_slots::llama_expert_slots(std::vector<int> n_slots, int n_expert, s
     for (size_t l = 0; l < n_slots.size(); ++l) {
         layers[l].slots.resize(std::max(n_slots[l], 0));
         layers[l].where.assign(n_expert, -1);
+        layers[l].wave.assign(n_expert, -1);
+        layers[l].preloaded.assign(n_expert, 0);
     }
     for (int i = 0; i < std::max(n_threads, 1); ++i) {
         threads.emplace_back([this] { worker(); });
@@ -62,20 +64,66 @@ void llama_expert_slots::drain() {
 }
 
 // an empty slot, else the least recently used ready slot whose expert the running remap does not
-// need; never a slot that is loading
-int llama_expert_slots::pick_victim(int l) const {
+// need; never a slot that is loading. While wave w_now of a plan stages, experts of later waves go
+// last: the ubatch needs them again.
+int llama_expert_slots::pick_victim(int l, int w_now) const {
     const auto & L = layers[l];
-    int best = -1;
+    int  best       = -1;
+    bool best_later = false;
     for (int s = 0; s < (int) L.slots.size(); ++s) {
         const slot & x = L.slots[s];
         if (x.state == EMPTY) {
             return s;
         }
-        if (x.state == READY && !keep[x.expert] && (best < 0 || x.last_use < L.slots[best].last_use)) {
-            best = s;
+        if (x.state != READY || keep[x.expert]) {
+            continue;
+        }
+        const bool later = w_now >= 0 && L.wave[x.expert] > w_now;
+        if (best < 0 || later < best_later || (later == best_later && x.last_use < L.slots[best].last_use)) {
+            best       = s;
+            best_later = later;
         }
     }
     return best;
+}
+
+// the caller holds the lock: queued prefetches of layer l whose expert nothing pins are dropped,
+// and their slots are free again
+void llama_expert_slots::drop_prefetches(int l) {
+    auto & L = layers[l];
+    for (auto it = q_prefetch.begin(); it != q_prefetch.end();) {
+        slot & x = layers[it->l].slots[it->slot];
+        if (it->l == l && !keep[x.expert]) {
+            counts_of(x.phase_decode).prefetch_cancelled++;
+            L.where[x.expert] = -1;
+            x = slot{};
+            it = q_prefetch.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// the caller holds the lock: a victim slot of layer l (pick_victim), its ready expert evicted, or
+// -1 if there is none and wait is false; with wait, it waits for a load to finish until there is one
+int llama_expert_slots::take_victim(int l, std::unique_lock<std::mutex> & lock, llama_expert_cache_counts & c, bool wait, int w_now) {
+    auto & L = layers[l];
+    int s;
+    while ((s = pick_victim(l, w_now)) < 0) {
+        if (!wait) {
+            return -1;
+        }
+        cv_done.wait(lock);
+    }
+    slot & x = L.slots[s];
+    if (x.state == READY) {
+        c.evictions++;
+        if (x.prefetched) {
+            counts_of(x.phase_decode).prefetch_wasted++;
+        }
+        L.where[x.expert] = -1;
+    }
+    return s;
 }
 
 // the caller holds the lock; slot s of layer l is empty or ready and no longer mapped
@@ -126,17 +174,7 @@ bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, i
     c.needed += needed.size();
 
     // queued prefetches of this layer that it does not need are dropped: their slots are free again
-    for (auto it = q_prefetch.begin(); it != q_prefetch.end();) {
-        slot & x = layers[it->l].slots[it->slot];
-        if (it->l == l && !keep[x.expert]) {
-            counts_of(x.phase_decode).prefetch_cancelled++;
-            L.where[x.expert] = -1;
-            x = slot{};
-            it = q_prefetch.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    drop_prefetches(l);
 
     // hits; a queued prefetch of a needed expert moves to the demand queue
     for (int e : needed) {
@@ -173,18 +211,7 @@ bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, i
             if (L.where[e] >= 0) {
                 continue;
             }
-            int s;
-            while ((s = pick_victim(l)) < 0) {
-                cv_done.wait(lock);
-            }
-            slot & x = L.slots[s];
-            if (x.state == READY) {
-                c.evictions++;
-                if (x.prefetched) {
-                    counts_of(x.phase_decode).prefetch_wasted++;
-                }
-                L.where[x.expert] = -1;
-            }
+            const int s = take_victim(l, lock, c, true);
             c.misses++;
             assign(l, s, e, true, decode);
         }
@@ -227,6 +254,226 @@ bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, i
     }
     release();
     return ok;
+}
+
+int llama_expert_wave_cap(int n_slots, int k) {
+    return k > 0 && n_slots >= 3*k ? (n_slots - k)/2 : 0;
+}
+
+int llama_expert_slots::plan_waves(int l, const int32_t * ids, int n, int k, int cap) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto & L = layers[l];
+    if (k <= 0 || cap < k) {
+        return -1;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (ids[i] < 0 || ids[i] >= n_expert) {
+            return -1;
+        }
+    }
+    for (const auto & wave : L.plan) {
+        for (int e : wave) {
+            L.wave[e]      = -1;
+            L.preloaded[e] = 0;
+        }
+    }
+    L.plan.clear();
+
+    // the union in first-use order, then stably sorted by use count, least used first
+    std::vector<int> uses(n_expert, 0);
+    std::vector<int> uniq;
+    for (int i = 0; i < n; ++i) {
+        if (uses[ids[i]]++ == 0) {
+            uniq.push_back(ids[i]);
+        }
+    }
+    needed = uniq; // last_needed(): the union in first-use order
+    std::stable_sort(uniq.begin(), uniq.end(), [&](int a, int b) { return uses[a] < uses[b]; });
+    for (size_t i = 0; i < uniq.size(); ++i) {
+        if (i % cap == 0) {
+            L.plan.emplace_back();
+        }
+        L.plan.back().push_back(uniq[i]);
+        L.wave[uniq[i]] = (int) L.plan.size() - 1;
+    }
+
+    in_flight = l;
+    drop_prefetches(l);
+    auto & c = c_prefill;
+    c.steps++;
+    c.needed += uniq.size();
+    return (int) L.plan.size();
+}
+
+bool llama_expert_slots::stage_wave(int l, int w, const int32_t * ids, int n, int k, int32_t * out) {
+    std::unique_lock<std::mutex> lock(mtx);
+    auto & L = layers[l];
+    auto & c = c_prefill;
+    static const std::vector<int> none;
+    const auto & cur = w < (int) L.plan.size() ? L.plan[w] : none;
+    const auto & nxt = w + 1 < (int) L.plan.size() ? L.plan[w + 1] : none;
+    in_flight = l;
+    tick++;
+
+    std::vector<int> pinned;
+    auto pin = [&](int e) {
+        if (!keep[e]) {
+            keep[e] = 1;
+            pinned.push_back(e);
+        }
+    };
+    auto release = [&] {
+        for (int e : pinned) {
+            keep[e] = 0;
+        }
+    };
+    for (int e : cur) {
+        pin(e);
+    }
+    // a wave of fewer than k experts parks on ready slots of others as well, the most recent first
+    std::vector<int> pool;
+    if ((int) cur.size() < k) {
+        std::vector<int> ready;
+        for (int s = 0; s < (int) L.slots.size(); ++s) {
+            if (L.slots[s].state == READY && !keep[L.slots[s].expert]) {
+                ready.push_back(s);
+            }
+        }
+        std::stable_sort(ready.begin(), ready.end(), [&](int a, int b) { return L.slots[a].last_use > L.slots[b].last_use; });
+        if ((int) ready.size() < k - (int) cur.size()) {
+            release();
+            return false;
+        }
+        for (int i = 0; i < k - (int) cur.size(); ++i) {
+            pin(L.slots[ready[i]].expert);
+            pool.push_back(ready[i]);
+        }
+    }
+    // what of the next wave is resident or loading already stays
+    for (int e : nxt) {
+        if (L.where[e] >= 0) {
+            pin(e);
+        }
+    }
+
+    // this wave: what the previous stage loaded ahead was counted there
+    auto load_missing = [&] {
+        for (int e : cur) {
+            if (L.where[e] >= 0) {
+                continue;
+            }
+            const int s = take_victim(l, lock, c, true, w);
+            c.misses++;
+            assign(l, s, e, true, false);
+        }
+    };
+    for (int e : cur) {
+        const int s = L.where[e];
+        if (L.preloaded[e]) {
+            L.preloaded[e] = 0;
+        } else if (s >= 0) {
+            (L.slots[s].state == READY ? c.hits : c.hits_loading)++;
+        }
+        if (s >= 0) {
+            L.slots[s].last_use = tick;
+        }
+    }
+    load_missing();
+    // the next wave loads behind this one, into slots this stage does not pin; what finds no slot
+    // loads at its own stage
+    for (int e : nxt) {
+        if (L.where[e] >= 0) {
+            continue;
+        }
+        const int s = take_victim(l, lock, c, false, w);
+        if (s < 0) {
+            break;
+        }
+        c.misses++;
+        assign(l, s, e, true, false);
+        L.preloaded[e] = 1;
+    }
+    cv_work.notify_all();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    bool ok = true;
+    for (;;) {
+        if (demand_failed) {
+            ok = false;
+            break;
+        }
+        bool pending = false;
+        bool lost    = false;
+        for (int e : cur) {
+            const int s = L.where[e];
+            if (s < 0) {
+                lost = true;
+            } else if (L.slots[s].state != READY) {
+                pending = true;
+            }
+        }
+        if (lost) {
+            load_missing();
+            cv_work.notify_all();
+            continue;
+        }
+        if (!pending) {
+            break;
+        }
+        cv_done.wait(lock);
+    }
+    c.wait_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!ok) {
+        release();
+        return false;
+    }
+    if (!cur.empty()) {
+        c.waves++;
+    }
+
+    // the wave's own pairs first, then each other pair of a row on a pool slot the row does not use
+    for (int e : cur) {
+        pool.push_back(L.where[e]);
+    }
+    std::vector<int32_t> used;
+    for (int r = 0; r < n; r += k) {
+        const int m = std::min(k, n - r);
+        used.clear();
+        for (int i = r; i < r + m; ++i) {
+            out[i] = -1;
+            if (L.wave[ids[i]] == w) {
+                out[i] = L.where[ids[i]];
+                used.push_back(out[i]);
+            }
+        }
+        size_t p = 0;
+        for (int i = r; i < r + m; ++i) {
+            if (out[i] >= 0) {
+                continue;
+            }
+            while (std::find(used.begin(), used.end(), pool[p]) != used.end()) {
+                p++;
+            }
+            out[i] = pool[p];
+            used.push_back(pool[p]);
+            c.wave_parked++;
+        }
+    }
+    release();
+    return true;
+}
+
+void llama_expert_slots::wave_mask(int l, int w, const int32_t * ids, int n, float * mask) const {
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto & L = layers[l];
+    for (int i = 0; i < n; ++i) {
+        mask[i] = ids[i] >= 0 && ids[i] < n_expert && L.wave[ids[i]] == w ? 1.0f : 0.0f;
+    }
+}
+
+int llama_expert_slots::wave_of(int l, int e) const {
+    std::lock_guard<std::mutex> lock(mtx);
+    return e >= 0 && e < n_expert ? layers[l].wave[e] : -1;
 }
 
 void llama_expert_slots::prefetch(int l, const int * experts, int n, bool decode) {

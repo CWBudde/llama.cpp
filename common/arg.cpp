@@ -2844,6 +2844,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_BUFFERED"));
     add_opt(common_arg(
+        {"--expert-cache-waves"},
+        "[EXPERIMENTAL] instead of capping the ubatch at the expert cache's slots / experts per token, run a larger ubatch's expert matmuls in waves over its experts, loading each wave into the slots (needs 3 * experts per token slots per layer)",
+        [](common_params & params) {
+            params.expert_cache_waves = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_WAVES"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {
