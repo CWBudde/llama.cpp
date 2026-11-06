@@ -8,6 +8,13 @@
 // a slot with pread (F_NOCACHE on macOS unless buffered, so the bytes do not stay in the page cache); the matmuls
 // then read the slots. The router chooses every expert: the expert weights keep its own ids, and a
 // prediction only ever decides what to read ahead.
+//
+// With waves, a ubatch whose experts do not fit the slots is not capped: its expert matmuls run once
+// per wave of (slots - n_expert_used)/2 of its experts. The graph, fixed at build, holds as few waves
+// as it takes with up to slots - n_expert_used experts each, and a large union grows its waves to
+// fit. Before each wave a CPU op loads the wave and queues the next one behind it; the pairs of other
+// waves read some slot of the wave and are multiplied by 0, so the sum over the waves adds every
+// pair's own result once.
 
 #include "llama.h"
 #include "llama-expert-slots.h"
@@ -66,6 +73,13 @@ struct llama_expert_cache {
         int il;
     };
 
+    // userdata of the wave ops of one layer and wave
+    struct wave_ud {
+        llama_expert_cache * cache;
+        int il;
+        int w;
+    };
+
     llama_expert_cache(const llama_expert_cache_params & p, int n_layer, int n_expert, int n_expert_used);
     ~llama_expert_cache();
 
@@ -75,8 +89,18 @@ struct llama_expert_cache {
     // a CPU buffer, or host memory the device uses in place (buffer_from_host_ptr, e.g. Metal).
     void init(const std::vector<tensors> & stacked, const std::vector<ggml_backend_dev_t> & devs, int fd);
 
-    // the largest ubatch whose experts always fit: the fewest slots of a layer over n_expert_used
+    // the largest ubatch whose experts always fit: the fewest slots of a layer over n_expert_used;
+    // unbounded with waves
     uint32_t max_ubatch() const;
+
+    // whether waves are on: asked for, and every layer has at least 3*n_expert_used slots
+    bool waves_on() const;
+
+    // the waves layer il's expert matmuls take for a ubatch of n_tokens, 1 when its experts always fit
+    int n_waves(int il, int n_tokens) const;
+
+    // the graph nodes the waves add for a ubatch of n_tokens
+    uint32_t wave_nodes(int n_tokens) const;
 
     // one context per model
     bool attach();
@@ -86,12 +110,22 @@ struct llama_expert_cache {
     // the slot ids of the router's selected experts [n_expert_used, n_tokens], from a CPU op
     ggml_tensor * build_remap(ggml_context * ctx, ggml_tensor * selected_experts, int il);
 
+    // wave w's slot ids [n_expert_used, n_tokens] for the contiguous router ids, from a CPU op that
+    // runs after after (the previous wave's sum, or null): it plans the waves at w 0, loads wave w
+    // and waits for it
+    ggml_tensor * build_wave_ids(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * after, int il, int w);
+
+    // 1 for the pairs of wave w, else 0 [1, n_expert_used, n_tokens], from a CPU op after wave_ids
+    ggml_tensor * build_wave_mask(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * wave_ids, int il, int w);
+
     ggml_tensor * gate(int il) const { return slot_t[il].t[0]; }
     ggml_tensor * up  (int il) const { return slot_t[il].t[1]; }
     ggml_tensor * down(int il) const { return slot_t[il].t[2]; }
 
-    // the remap op's work
+    // the ops' work
     void remap(int il, const ggml_tensor * ids, ggml_tensor * dst);
+    void wave_ids(int il, int w, const ggml_tensor * ids, ggml_tensor * dst);
+    void wave_mask(int il, int w, const ggml_tensor * ids, ggml_tensor * dst);
 
     // the decode timing to add to the stats; the model owns it
     void set_decode_diag(const llama_decode_diag * d) { diag = d; }
@@ -100,6 +134,9 @@ struct llama_expert_cache {
 
 private:
     bool load(int il, int e, int s);
+    void begin(int il, int n_tokens);
+    void observe(int il);
+    [[noreturn]] void fail(int il, int n_tokens);
 
     const int n_layer, n_expert, n_expert_used;
     std::vector<int> n_slots; // per layer
@@ -109,11 +146,13 @@ private:
     double prefetch_mix;
     std::string stats_path;
     bool buffered; // misses read through the page cache
+    bool waves;    // asked for: see waves_on()
 
     std::vector<tensors>  stacked;
     std::vector<tensors>  slot_t; // the slot tensors; offs unused
     std::vector<size_t>   expert_bytes; // per layer
     std::vector<layer_ud> ud;
+    std::vector<std::vector<wave_ud>> wud; // per layer, per wave
 
     // the slots of the layers of one device
     struct group {

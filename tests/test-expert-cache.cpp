@@ -295,6 +295,230 @@ static void test_stress() {
     CHECK(d.prefetch_issued > 0 && d.prefetch_used > 0);
 }
 
+// a ubatch of n_tok token rows of k distinct experts each: row t uses the hot expert t % n_hot and
+// k-1 others that rotate through the rest
+static std::vector<int32_t> wave_ids(int n_tok, int k, int n_hot, int n_expert) {
+    std::vector<int32_t> ids;
+    for (int t = 0; t < n_tok; ++t) {
+        ids.push_back(t % n_hot);
+        for (int j = 1; j < k; ++j) {
+            ids.push_back(n_hot + (t*(k-1) + j - 1) % (n_expert - n_hot));
+        }
+    }
+    return ids;
+}
+
+// stages every wave of a plan, as the graph would, and checks after each stage what the graph
+// relies on: the pairs of the wave map to slots holding their expert; every other pair of a row
+// gets a distinct slot that holds some expert; and none of these slots changes while the wave's
+// GEMMs would run (here: until the loads queued so far have finished). It returns the number of
+// waves, or -1 after a failed stage.
+static int run_waves(fake & f, llama_expert_slots & c, int l, const std::vector<int32_t> & ids, int k, int cap, int n_built, int plan_built = 0) {
+    const int n = (int) ids.size();
+    const int n_waves = c.plan_waves(l, ids.data(), n, k, cap, plan_built);
+    if (n_waves < 0) {
+        return -1;
+    }
+    std::vector<int> waves_of_pair(n, 0);
+    for (int w = 0; w < std::max(n_built, n_waves); ++w) {
+        std::vector<int32_t> out(n, -1);
+        std::vector<float>   mask(n, -1.0f);
+        if (!c.stage_wave(l, w, ids.data(), n, k, out.data())) {
+            return -1;
+        }
+        c.wave_mask(l, w, ids.data(), n, mask.data());
+        std::vector<int> held(n);
+        for (int i = 0; i < n; ++i) {
+            const bool in = c.wave_of(l, ids[i]) == w;
+            CHECK(mask[i] == (in ? 1.0f : 0.0f));
+            CHECK(out[i] >= 0 && out[i] < f.n_slots);
+            held[i] = out[i] >= 0 && out[i] < f.n_slots ? f.at(l, out[i]) : -2;
+            CHECK(in ? held[i] == ids[i] : held[i] >= 0);
+            waves_of_pair[i] += in;
+        }
+        for (int t = 0; t < n/k; ++t) {
+            std::set<int32_t> row(out.begin() + t*k, out.begin() + (t+1)*k);
+            CHECK((int) row.size() == k);
+        }
+        c.drain(); // the next wave's preloads have landed: none may have hit a slot this wave reads
+        for (int i = 0; i < n; ++i) {
+            CHECK(out[i] >= 0 && out[i] < f.n_slots && f.at(l, out[i]) == held[i]);
+        }
+    }
+    for (int i = 0; i < n; ++i) {
+        CHECK(waves_of_pair[i] == 1); // the per-wave sum adds each pair exactly once
+    }
+    return n_waves;
+}
+
+static void test_wave_cap() {
+    CHECK(llama_expert_wave_cap(128, 6) == 61);
+    CHECK(llama_expert_wave_cap(18, 6) == 6);
+    CHECK(llama_expert_wave_cap(17, 6) == 0); // fewer than 3k slots: no waves
+    CHECK(llama_expert_wave_cap(384, 6) == 189);
+
+    // the graph holds as many waves as it takes with waves of up to slots - k experts
+    CHECK(llama_expert_wave_count(384, 128, 6) == 4);
+    CHECK(llama_expert_wave_count(384, 64, 6) == 7);
+    CHECK(llama_expert_wave_count(132, 128, 6) == 2);
+    CHECK(llama_expert_wave_count(40, 18, 6) == 4);
+}
+
+static void test_waves_plan() {
+    // 20 experts used by 12 rows of 3: 0..3 are hot (3 rows each), 4..19 rotate (1-2 rows each)
+    fake f(1, 20);
+    auto c = make(f, 32, 2);
+    const int k = 3, cap = llama_expert_wave_cap(20, k);
+    CHECK(cap == 8);
+    const auto ids = wave_ids(12, k, 4, 20);
+    CHECK(c->plan_waves(0, ids.data(), (int) ids.size(), k, 2) < 0); // a wave below k
+    const int n_waves = c->plan_waves(0, ids.data(), (int) ids.size(), k, cap);
+    CHECK(n_waves == 3);
+    // each expert in exactly one wave, at most cap per wave, the most used last
+    std::vector<int> size(n_waves, 0);
+    for (int e = 0; e < 20; ++e) {
+        const int w = c->wave_of(0, e);
+        CHECK(w >= 0 && w < n_waves);
+        if (w >= 0 && w < n_waves) {
+            size[w]++;
+        }
+    }
+    for (int s : size) {
+        CHECK(s <= cap);
+    }
+    for (int e = 0; e < 4; ++e) {
+        CHECK(c->wave_of(0, e) == n_waves - 1);
+    }
+    CHECK(c->wave_of(0, 25) < 0);
+    // ids out of range plan nothing
+    const int32_t bad[] = {0, 1, 40};
+    CHECK(c->plan_waves(0, bad, 3, k, cap) < 0);
+}
+
+static void test_waves_stage() {
+    // 2 layers, 18 slots, k 6: cap 6, so 64 rows over 40 experts take 7 waves; one layer has
+    // stale experts from a decode remap first; slow loads, so preloads overlap the "GEMMs"
+    fake f(2, 18);
+    f.delay_us = 200;
+    auto c = make(f, 48, 4);
+    const int k = 6, cap = llama_expert_wave_cap(18, k);
+    std::vector<int32_t> out;
+    CHECK(remap(*c, 1, {40, 41, 42, 43, 44, 45}, out));
+    for (int l = 0; l < 2; ++l) {
+        const auto ids = wave_ids(64, k, 5, 40);
+        CHECK(run_waves(f, *c, l, ids, k, cap, 9) == 7); // two empty waves built beyond the plan
+    }
+    CHECK(!f.overlap);
+    const auto p = c->counts(false);
+    CHECK(p.steps == 2 && p.needed == 80 && p.waves == 14 && p.waves_built == 18);
+    CHECK(p.hits + p.hits_loading + p.misses == p.needed);
+    CHECK(p.misses == 80 && p.demand_bytes == 100*80 && p.load_failures == 0);
+    CHECK(p.prefetch_issued == 0 && p.wave_parked > 0);
+    // the most used experts of the last ubatch are what the slots hold afterwards
+    for (int e = 0; e < 5; ++e) {
+        CHECK(c->slot_of(1, e) >= 0);
+    }
+    // a second identical ubatch: its last wave is resident, the rest loads again
+    const auto ids = wave_ids(64, k, 5, 40);
+    CHECK(run_waves(f, *c, 0, ids, k, cap, 7) == 7);
+    CHECK(c->counts(false).hits > 0);
+}
+
+static void test_waves_tight() {
+    // a cap above llama_expert_wave_cap: a wave and the next one's preloads no longer fit in the
+    // slots together, so the preloads find too few victims; they must not take the wave's own
+    // slots, and the experts that find none load at their own stage
+    fake f(1, 18);
+    f.delay_us = 100;
+    auto c = make(f, 48, 4);
+    const auto ids = wave_ids(64, 6, 5, 40);
+    CHECK(run_waves(f, *c, 0, ids, 6, 10, 0) == 4);
+    CHECK(run_waves(f, *c, 0, ids, 6, 10, 0) == 4);
+    CHECK(!f.overlap);
+    const auto p = c->counts(false);
+    CHECK(p.hits + p.hits_loading + p.misses == p.needed && p.load_failures == 0);
+}
+
+static void test_waves_built() {
+    // the graph's 4 waves are enough at 18 slots: a union of 40 grows its waves from 6 to 10
+    const int k = 6, cap = llama_expert_wave_cap(18, k), built = llama_expert_wave_count(40, 18, k);
+    {
+        fake f(1, 18);
+        f.delay_us = 100;
+        auto c = make(f, 48, 4);
+        const auto ids = wave_ids(64, k, 5, 40);
+        CHECK(run_waves(f, *c, 0, ids, k, cap, built, built) == built);
+        CHECK(run_waves(f, *c, 0, ids, k, cap, built, built) == built);
+        CHECK(!f.overlap);
+        const auto p = c->counts(false);
+        CHECK(p.waves == 2*(uint64_t) built && p.waves_built == 2*(uint64_t) built);
+        CHECK(p.hits + p.hits_loading + p.misses == p.needed && p.load_failures == 0);
+        // more waves than 4 are needed with the cap alone, one is too few for the slots
+        CHECK(c->plan_waves(0, ids.data(), (int) ids.size(), k, cap) == 7);
+        CHECK(c->plan_waves(0, ids.data(), (int) ids.size(), k, cap, 1) < 0);
+    }
+    {
+        // a smaller union keeps waves of the cap; the graph's last wave stays empty, parked
+        fake f(1, 18);
+        auto c = make(f, 48, 4);
+        const auto ids = wave_ids(12, k, 3, 13);
+        CHECK(run_waves(f, *c, 0, ids, k, cap, built, built) == 3);
+        const auto p = c->counts(false);
+        CHECK(p.waves == 3 && p.waves_built == 4);
+    }
+}
+
+static void test_waves_next_resident() {
+    // the next wave is resident, and a wave above the cap does not fit beside all of it: it takes
+    // what it needs of the next wave's slots, instead of waiting for a slot that never frees
+    fake f(1, 18);
+    auto c = make(f, 48, 2);
+    std::vector<int32_t> out;
+    std::vector<int32_t> next;
+    for (int e = 10; e < 20; ++e) {
+        next.push_back(e);
+    }
+    CHECK(remap(*c, 0, next, out));
+    // experts 0..9 once, 10..19 twice: wave 0 is 0..9, wave 1 is 10..19
+    const std::vector<int32_t> ids = {
+        0, 1, 2, 3, 4, 5,  6, 7, 8, 9, 10, 11,  12, 13, 14, 15, 16, 17,  18, 19, 10, 11, 12, 13,  14, 15, 16, 17, 18, 19,
+    };
+    const int k = 6, cap = llama_expert_wave_cap(18, k);
+    CHECK(run_waves(f, *c, 0, ids, k, cap, 2, 2) == 2);
+    for (int e = 0; e < 10; ++e) {
+        CHECK(c->wave_of(0, e) == 0);
+        CHECK(c->wave_of(0, e + 10) == 1);
+    }
+    const auto p = c->counts(false);
+    CHECK(p.needed == 20 && p.hits == 8 && p.misses == 12 && p.hits_loading == 0);
+}
+
+static void test_waves_prefetched() {
+    // a decode's prefetch that a wave uses is credited as used, and one nobody uses as wasted
+    fake f(1, 18);
+    auto c = make(f, 48, 2);
+    const int pre[] = {0, 1, 2, 45};
+    c->prefetch(0, pre, 4, true);
+    c->drain();
+    const int k = 6, cap = llama_expert_wave_cap(18, k);
+    const auto ids = wave_ids(64, k, 5, 40);
+    CHECK(run_waves(f, *c, 0, ids, k, cap, 7) == 7);
+    CHECK(run_waves(f, *c, 0, ids, k, cap, 7) == 7);
+    const auto d = c->counts(true);
+    CHECK(d.prefetch_issued == 4 && d.prefetch_used == 3 && d.prefetch_wasted == 1);
+}
+
+static void test_waves_failure() {
+    fake f(1, 18);
+    auto c = make(f, 48, 2);
+    const int k = 6, cap = llama_expert_wave_cap(18, k);
+    f.failing.insert({0, 30});
+    const auto ids = wave_ids(32, k, 5, 40);
+    CHECK(run_waves(f, *c, 0, ids, k, cap, 0) < 0);
+    int l = -1, e = -1;
+    CHECK(c->failure(l, e) && l == 0 && e == 30);
+}
+
 static void test_top_k() {
     std::vector<int> out;
     llama_expert_top_k({0.5, 2.0, 1.0, 2.0, 0.0}, 3, out);
@@ -355,6 +579,14 @@ int main(int argc, char ** argv) {
     test_in_flight();
     test_failures();
     test_stress();
+    test_wave_cap();
+    test_waves_plan();
+    test_waves_stage();
+    test_waves_tight();
+    test_waves_built();
+    test_waves_next_resident();
+    test_waves_prefetched();
+    test_waves_failure();
     test_top_k();
     if (argc > 1) {
         test_markov_fixture(argv[1]);
