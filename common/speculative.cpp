@@ -2580,6 +2580,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
 
+    // [EXPERIMENTAL] the expert cache is the target's: Kolibri only, and one context per model
+    result.expert_cache = 0;
+    result.expert_cache_layers.clear();
+    result.expert_cache_stats.clear();
+
     if (has_draft) {
         // default to global devices value
         if (!params_spec.devices.empty()) {

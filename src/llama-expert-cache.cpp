@@ -17,11 +17,13 @@
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #elif defined(__linux__)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -361,6 +363,18 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
 #else
     GGML_UNUSED(fd_loader);
     throw std::runtime_error("expert cache: not supported on this platform");
+#endif
+#if defined(__APPLE__) || defined(__linux__)
+    // the cache has its own open file, since F_NOCACHE would reach the loader's through a dup. A path
+    // can name another file by now, and the offsets would read wrong weights without an error
+    struct stat st_loader = {};
+    struct stat st_own = {};
+    if (fstat(fd_loader, &st_loader) != 0 || fstat(fd, &st_own) != 0) {
+        throw std::runtime_error(format("expert cache: fstat of %s: %s", path.c_str(), strerror(errno)));
+    }
+    if (st_loader.st_dev != st_own.st_dev || st_loader.st_ino != st_own.st_ino) {
+        throw std::runtime_error(format("expert cache: %s was replaced while the model loaded", path.c_str()));
+    }
 #endif
 
     ud.resize(n_layer);
