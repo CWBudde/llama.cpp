@@ -348,6 +348,10 @@ llama_context::llama_context(
 
     // [EXPERIMENTAL] with the expert cache, the experts of every ubatch must fit its slots
     if (model.expert_cache) {
+        // both would take over the same matmuls: the graph has one slot map for an expert tensor
+        if (params.moe_cache_size > 0) {
+            throw std::runtime_error("the expert cache and the MoE cache cannot serve one model: drop --moe-cache-mib");
+        }
         // refused early, before buffers are allocated; attach() below decides
         if (model.expert_cache->in_use()) {
             throw std::runtime_error("the expert cache serves one context per model, and it has one");
@@ -1587,6 +1591,12 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // [EXPERIMENTAL] graph_compute is async, and the next ubatch's remap and prefetch can evict a slot
+    // the last graph's matmuls still read
+    if (model.expert_cache) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
