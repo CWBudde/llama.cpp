@@ -65,6 +65,10 @@ struct llama_expert_slots {
     // the slot an expert of layer l sits in, ready or loading, or -1
     int slot_of(int l, int e) const;
 
+    // [EXPERIMENTAL] layer l's table for the GPU remap, n_expert entries: an expert's slot when it
+    // holds its bytes, else -1. A loading expert is -1, so a gate that reads the table stops there.
+    void copy_table(int l, int32_t * table) const;
+
     // waits until no load is queued or running
     void drain();
 

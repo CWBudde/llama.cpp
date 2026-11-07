@@ -8,6 +8,16 @@ extern "C" {
 
 typedef struct ggml_metal_op * ggml_metal_op_t;
 
+// [EXPERIMENTAL] the expert cache's gates in the graph being encoded
+struct ggml_metal_op_gates {
+    void *     metal_buf;    // the words of ggml_metal_encoder_gate_init
+    uint32_t * words;
+    uint32_t   cap;
+    const int32_t * of_node; // the gate at each graph node, or -1
+};
+
+void ggml_metal_op_set_gates(ggml_metal_op_t ctx, const struct ggml_metal_op_gates * gates);
+
 struct ggml_metal_fusion; // forward decl (ggml-metal-device.h)
 
 ggml_metal_op_t ggml_metal_op_init(

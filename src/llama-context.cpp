@@ -1,6 +1,8 @@
 #include "llama-context.h"
 #include "llama-expert-cache.h"
 
+#include "ggml-metal.h"
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -601,6 +603,35 @@ llama_context::llama_context(
             metal_n_commits = (uint64_t (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_get_n_commits");
         }
         model.decode_diag->set_metal(metal_n_commits != nullptr);
+    }
+
+    // [EXPERIMENTAL] the expert cache's GPU remap runs behind the Metal backend's gates
+    if (model.expert_cache && model.expert_cache->gpu_remap()) {
+        typedef void (*set_gate_t)(ggml_backend_t, const ggml_backend_metal_expert_gate *);
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL");
+        auto set_gate = reg ? (set_gate_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_expert_gate") : nullptr;
+        int n_set = 0;
+        if (set_gate) {
+            const ggml_backend_metal_expert_gate gate = {
+                [](void * user, int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped) {
+                    ((llama_expert_cache *) user)->gate_remap(il, ids, n_ids, n_tokens, stopped);
+                },
+                [](void * user, int n_tokens, bool stopped) {
+                    ((llama_expert_cache *) user)->gate_run(n_tokens, stopped);
+                },
+                model.expert_cache.get(),
+            };
+            for (auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                if (dev && ggml_backend_dev_backend_reg(dev) == reg) {
+                    set_gate(backend.get(), &gate);
+                    n_set++;
+                }
+            }
+        }
+        if (n_set == 0) {
+            throw std::runtime_error("expert cache: --expert-cache-gpu-remap needs a Metal backend with the expert gate, and this context has none");
+        }
     }
 
     // [EXPERIMENTAL] the expert cache serves one context; taken last, so that a constructor that
@@ -1619,6 +1650,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    // [EXPERIMENTAL] the gates ran synchronously, each layer once, or a layer left the GPU
+    if (status == GGML_STATUS_SUCCESS && model.expert_cache && model.expert_cache->gpu_remap()) {
+        model.expert_cache->gate_check_graph();
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

@@ -122,7 +122,20 @@ private:
 
     // non-empty node indices
     std::vector<int> idxs;
+
+public:
+    int graph_index(int i) const {
+        return idxs[i];
+    }
+
+    // [EXPERIMENTAL] the expert cache's gates, if the graph has any
+    const ggml_metal_op_gates * gates = nullptr;
 };
+
+void ggml_metal_op_set_gates(ggml_metal_op_t ctx, const ggml_metal_op_gates * gates) {
+    ctx->gates = gates;
+    ggml_metal_encoder_gate_init(ctx->enc, gates->metal_buf, gates->words, gates->cap);
+}
 
 ggml_metal_op_t ggml_metal_op_init(
         ggml_metal_device_t dev,
@@ -2821,8 +2834,61 @@ size_t ggml_metal_op_mul_mat_id_extra_amax(const ggml_tensor * op) {
     return 8 + N_MM_NPART_AMAX*sizeof(float);
 }
 
+// [EXPERIMENTAL] before the first matmul of an expert layer: maps the router's ids to slots, and stops
+// the command buffer if one has none. The rest of the command buffer's dispatches become indirect.
+static void ggml_metal_op_expert_gate(ggml_metal_op_t ctx, ggml_tensor * op, int gate) {
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * ids   = op->src[2];
+    const ggml_tensor * slots = op->src[3];
+    const ggml_tensor * table = op->src[4];
+
+    // the router has written its ids; nothing else of this layer runs alongside the gate
+    ggml_metal_op_concurrency_reset(ctx);
+
+    // the log holds a ubatch's ids; the context caps the ubatch to fit
+    GGML_ASSERT(ids->ne[1] <= ggml_get_op_params_i32(slots, 1));
+
+    const uint32_t next = ggml_metal_encoder_gate_next(enc);
+
+    ggml_metal_kargs_expert_gate args = {
+        /*.n_used   =*/ (int32_t) ids->ne[0],
+        /*.n_tokens =*/ (int32_t) ids->ne[1],
+        /*.nb1      =*/ ids->nb[1],
+        /*.n_log    =*/ (int32_t) (ids->ne[0]*ggml_get_op_params_i32(slots, 1)),
+        /*.gate     =*/ (uint32_t) gate,
+        /*.entry    =*/ next + (ggml_metal_encoder_gate_active(enc) ? 1 : 0),
+        /*.hdr      =*/ GGML_METAL_GATE_HDR,
+    };
+
+    ggml_metal_buffer_id bid_words = { ctx->gates->metal_buf, 0 };
+
+    ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_expert_gate(ctx->lib));
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(table), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(slots), 3);
+    ggml_metal_encoder_set_buffer  (enc, bid_words,                       4);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
+
+    ggml_metal_encoder_gate_start(enc);
+
+    // the matmuls read the slot ids, and the following indirect dispatches the entries
+    ggml_metal_op_concurrency_reset(ctx);
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    // [EXPERIMENTAL] with the expert cache's GPU remap, the matmul reads its ids from the slot ids
+    if (op->src[3]) {
+        GGML_ASSERT(ctx->gates && "a MUL_MAT_ID with slot ids needs the expert cache's gate");
+        const int gate = ctx->gates->of_node[ctx->graph_index(idx)];
+        if (gate >= 0) {
+            ggml_metal_op_expert_gate(ctx, op, gate);
+        }
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -2849,8 +2915,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
     ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
-    ggml_metal_buffer_id bid_src2 = ggml_metal_get_buffer_id(op->src[2]);
+    ggml_metal_buffer_id bid_src2 = ggml_metal_get_buffer_id(op->src[3] ? op->src[3] : op->src[2]);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+
+    // the slot ids' rows are contiguous, unlike the router's
+    const uint64_t nb_ids = op->src[3] ? ne20*sizeof(int32_t) : nb21;
 
     const uint32_t r2 = 1;
     const uint32_t r3 = 1;
@@ -2913,7 +2982,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 nb12,
                 ne21, // n_tokens
                 ne20, // n_expert_used
-                nb21,
+                nb_ids,
             };
 
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
@@ -3001,7 +3070,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_kargs_mul_mv_id args = {
             /*.nei0 =*/ ne20,
             /*.nei1 =*/ ne21,
-            /*.nbi1 =*/ nb21,
+            /*.nbi1 =*/ nb_ids,
             /*.ne00 =*/ ne00,
             /*.ne01 =*/ ne01,
             /*.ne02 =*/ ne02,

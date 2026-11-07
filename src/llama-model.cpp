@@ -3457,6 +3457,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
         /*.prefetch_mix       =*/ 0.75f,
         /*.stats_path         =*/ nullptr,
         /*.buffered           =*/ false,
+        /*.gpu_remap          =*/ false,
     };
 
     return result;

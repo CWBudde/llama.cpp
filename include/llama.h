@@ -331,6 +331,8 @@ extern "C" {
         const char *    stats_path;    // optional: write the cache counters as JSON when the model is freed;
                                        // with n_slots 0 and no n_slots_layer, the decode timing of the resident model
         bool            buffered;      // read misses through the page cache (macOS: no F_NOCACHE)
+        bool            gpu_remap;     // map the router's ids to slots on the GPU, without a CPU split per layer
+                                       // (every expert layer on Metal; no prefetch; else the model fails to load)
     };
 
     struct llama_model_params {

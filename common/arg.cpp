@@ -2844,6 +2844,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_BUFFERED"));
     add_opt(common_arg(
+        {"--expert-cache-gpu-remap"},
+        "[EXPERIMENTAL] map the router's ids to slots on the GPU, with no CPU split per layer: every expert layer on Metal, "
+        "no --expert-prefetch; otherwise the model fails to load (default: off)",
+        [](common_params & params) {
+            params.expert_cache_gpu_remap = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_GPU_REMAP"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {

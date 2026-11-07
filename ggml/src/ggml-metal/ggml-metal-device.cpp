@@ -1242,6 +1242,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_p
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_expert_gate(ggml_metal_library_t lib) {
+    const char * name = "kernel_expert_gate";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(ggml_metal_library_t lib) {
     char base[256];
     char name[256];
