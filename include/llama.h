@@ -331,6 +331,8 @@ extern "C" {
         const char *    stats_path;    // optional: write the cache counters as JSON when the model is freed;
                                        // with n_slots 0 and no n_slots_layer, the decode timing of the resident model
         bool            buffered;      // read misses through the page cache (macOS: no F_NOCACHE)
+        const char *    sidefile_path; // optional: read misses from this side-file (kolibri-sidefile write), one pread
+                                       // per expert; the load fails if its table does not match the model and the GGUF
     };
 
     struct llama_model_params {

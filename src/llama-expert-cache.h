@@ -10,6 +10,7 @@
 // prediction only ever decides what to read ahead.
 
 #include "llama.h"
+#include "llama-expert-sidefile.h"
 #include "llama-expert-slots.h"
 
 #include "ggml.h"
@@ -99,7 +100,7 @@ struct llama_expert_cache {
     std::string stats_json() const;
 
 private:
-    bool load(int il, int e, int s);
+    bool load(int il, int e, int s, uint64_t & preads);
 
     const int n_layer, n_expert, n_expert_used;
     std::vector<int> n_slots; // per layer
@@ -109,6 +110,7 @@ private:
     double prefetch_mix;
     std::string stats_path;
     bool buffered; // misses read through the page cache
+    std::string sidefile_path;
 
     std::vector<tensors>  stacked;
     std::vector<tensors>  slot_t; // the slot tensors; offs unused
@@ -128,6 +130,10 @@ private:
 
     std::string path;
     int fd = -1;
+
+    // with --expert-cache-sidefile the misses come from here, one pread per expert; fd only checks the GGUF's identity
+    std::unique_ptr<llama_expert_sidefile> sidefile;
+    std::vector<std::array<llama_expert_stacked, 3>> rows; // the GGUF path's ranges, per layer
 
     std::unique_ptr<llama_expert_slots>  slots;
     std::unique_ptr<llama_expert_markov> markov;

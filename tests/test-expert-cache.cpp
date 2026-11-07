@@ -1,19 +1,32 @@
-// Tests of the expert cache's bookkeeping (src/llama-expert-slots.*) with a fake loader, and of its
-// Markov predictor against the predictions of the Go original:
+// Tests of the expert cache's bookkeeping (src/llama-expert-slots.*) with a fake loader, of its
+// Markov predictor against the predictions of the Go original, and of its two read paths
+// (src/llama-expert-sidefile.*) on a synthetic GGUF and side-file:
 //
 //   test-expert-cache [markov-fixture.json]
+//   test-expert-cache --sidefile GGUF SIDEFILE [EXPERTS_PER_LAYER]
 //
 // The fixture is testdata/locality/markov-fixture.json of the kolibri-llama-cpp repository; without
 // it the predictor check is skipped.
+//
+// --sidefile checks a real pair instead: a side-file written by kolibri-sidefile, opened as the
+// model's load opens it, with the ranges taken from the GGUF's own header as the model's loader
+// takes them. Every expert (or EXPERTS_PER_LAYER spread over each layer) reads the same bytes on
+// both paths, at 3 and at 1 pread.
 
+#include "../src/llama-expert-sidefile.h"
 #include "../src/llama-expert-slots.h"
+
+#include "ggml.h"
+#include "gguf.h"
 
 #include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -21,6 +34,12 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__APPLE__) || defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#define HAVE_SIDEFILE_TESTS 1
+#endif
 
 static int n_failed = 0;
 
@@ -86,7 +105,7 @@ struct fake {
 
 static std::unique_ptr<llama_expert_slots> make(fake & f, int n_expert, int n_threads, size_t bytes = 100) {
     return std::make_unique<llama_expert_slots>(std::vector<int>(f.n_layer, f.n_slots), n_expert,
-        std::vector<size_t>(f.n_layer, bytes), n_threads, [&f](int l, int e, int s) { return f.load(l, e, s); });
+        std::vector<size_t>(f.n_layer, bytes), n_threads, [&f](int l, int e, int s, uint64_t & preads) { preads++; return f.load(l, e, s); });
 }
 
 // every id maps to a slot that holds it
@@ -295,6 +314,487 @@ static void test_stress() {
     CHECK(d.prefetch_issued > 0 && d.prefetch_used > 0);
 }
 
+// a layer's misses are issued concurrently over the I/O threads: all four threads are inside a load
+// of one remap at once, or no load gets past the barrier (and a timeout fails the check)
+static void test_concurrent_misses() {
+    std::atomic<int> inside{0};
+    std::atomic<int> most{0};
+    llama_expert_slots c(std::vector<int>(1, 8), 16, std::vector<size_t>(1, 100), 4, [&](int, int, int, uint64_t & preads) {
+        preads++;
+        const int now = ++inside;
+        for (int prev = most; now > prev && !most.compare_exchange_weak(prev, now);) {
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        while (most < 4 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        inside--;
+        return true;
+    });
+    std::vector<int32_t> out;
+    CHECK(remap(c, 0, {0, 1, 2, 3, 4, 5}, out));
+    CHECK(most == 4);
+    const auto d = c.counts(true);
+    CHECK(d.misses == 6 && d.loads == 6 && d.preads == 6 && d.load_failures == 0);
+}
+
+// a load's read calls are counted in its phase, failed loads too, and only finished loads count as loads
+static void test_preads_counted() {
+    fake f(1, 4);
+    llama_expert_slots c(std::vector<int>(1, 4), 8, std::vector<size_t>(1, 100), 1, [&f](int l, int e, int s, uint64_t & preads) {
+        preads += 3;
+        return f.load(l, e, s);
+    });
+    std::vector<int32_t> out;
+    CHECK(remap(c, 0, {0, 1}, out, false));
+    CHECK(remap(c, 0, {1, 2}, out, true));
+    auto p = c.counts(false), d = c.counts(true);
+    CHECK(p.loads == 2 && p.preads == 6);
+    CHECK(d.loads == 1 && d.preads == 3 && d.hits == 1);
+    f.failing.insert({0, 3});
+    CHECK(!remap(c, 0, {3}, out, true));
+    d = c.counts(true);
+    CHECK(d.loads == 1 && d.preads == 6 && d.load_failures == 1);
+}
+
+static std::string hex32(const uint8_t * p) {
+    std::string s;
+    char b[3];
+    for (int i = 0; i < 32; ++i) {
+        snprintf(b, sizeof(b), "%02x", p[i]);
+        s += b;
+    }
+    return s;
+}
+
+static void test_sha256() {
+    const auto sum = [](const std::string & m) {
+        uint8_t out[32];
+        llama_expert_sha256(m.data(), m.size(), out);
+        return hex32(out);
+    };
+    CHECK(sum("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    CHECK(sum("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    CHECK(sum("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    CHECK(sum(std::string(1000000, 'a')) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+#ifdef HAVE_SIDEFILE_TESTS
+// A synthetic GGUF and its side-file: a header of random bytes, then three layers of stacked rows
+// in the file's own order (down first) with a different row size for down. The table is written here
+// as kolibri-sidefile writes it; tools/gguf/check_expert_cache.py reads what the tool itself writes.
+struct sidefile_fixture {
+    static constexpr int      n_layer  = 3;
+    static constexpr int      n_expert = 8;
+    static constexpr uint32_t align    = 16384;
+    static constexpr size_t   head     = 1000;
+    static constexpr size_t   row_gate = 12345;
+    static constexpr size_t   row_down = 33000;
+
+    std::string dir, gguf_path, side_path;
+    std::vector<uint8_t> gguf;
+    std::vector<std::array<llama_expert_stacked, 3>> stacked;
+    std::vector<uint8_t> table; // the side-file's table, unpadded
+
+    sidefile_fixture() {
+        const char * tmp = getenv("TMPDIR");
+        std::string tmpl = std::string(tmp ? tmp : "/tmp") + "/test-expert-cache-XXXXXX";
+        CHECK(mkdtemp(tmpl.data()) != nullptr);
+        dir = tmpl;
+        gguf_path = dir + "/m.gguf";
+        side_path = dir + "/m.gguf.experts";
+
+        std::mt19937 rng(11);
+        gguf.resize(head);
+        stacked.resize(n_layer);
+        const auto append_rows = [&](llama_expert_stacked & t, size_t row, uint32_t type) {
+            t = { (uint64_t) gguf.size(), (uint64_t) row, type };
+            for (size_t i = 0; i < row*n_expert; ++i) {
+                gguf.push_back(0);
+            }
+        };
+        for (auto & lt : stacked) {
+            append_rows(lt[2], row_down, 23);
+            append_rows(lt[0], row_gate, 18);
+            append_rows(lt[1], row_gate, 18);
+        }
+        for (auto & b : gguf) {
+            b = (uint8_t) (rng() | 1);
+        }
+        write_gguf();
+        table = build_table();
+        write_side();
+    }
+
+    ~sidefile_fixture() {
+        unlink(gguf_path.c_str());
+        unlink(side_path.c_str());
+        rmdir(dir.c_str());
+    }
+
+    static void put_u32(std::vector<uint8_t> & b, uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            b.push_back((uint8_t) (v >> (8*i)));
+        }
+    }
+    static void put_u64(std::vector<uint8_t> & b, uint64_t v) {
+        put_u32(b, (uint32_t) v);
+        put_u32(b, (uint32_t) (v >> 32));
+    }
+    static void set_u64(std::vector<uint8_t> & b, size_t at, uint64_t v) {
+        for (int i = 0; i < 8; ++i) {
+            b[at + i] = (uint8_t) (v >> (8*i));
+        }
+    }
+    static void set_u32(std::vector<uint8_t> & b, size_t at, uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            b[at + i] = (uint8_t) (v >> (8*i));
+        }
+    }
+
+    static constexpr size_t table_bytes_of() { return 128 + (size_t) n_layer*3*24 + (size_t) n_layer*n_expert*8; }
+    static constexpr uint32_t version_next() { return llama_expert_sidefile::version + 1; }
+
+    size_t extent() const { return (2*row_gate + row_down + align - 1)/align*align; }
+    size_t table_bytes() const { return table_bytes_of(); }
+    size_t data_start() const { return (table_bytes() + align - 1)/align*align; }
+    size_t file_size() const { return data_start() + (size_t) n_layer*n_expert*extent(); }
+    size_t offset_at(int il, int e) const { return 128 + (size_t) n_layer*3*24 + ((size_t) il*n_expert + e)*8; }
+
+    static void seal(std::vector<uint8_t> & t) {
+        memset(&t[88], 0, 32);
+        uint8_t sum[32];
+        llama_expert_sha256(t.data(), t.size(), sum);
+        memcpy(&t[88], sum, 32);
+    }
+
+    std::vector<uint8_t> build_table() const {
+        std::vector<uint8_t> t;
+        for (const char c : std::string("KOLIEXPT")) {
+            t.push_back((uint8_t) c);
+        }
+        put_u32(t, llama_expert_sidefile::version);
+        put_u32(t, align);
+        put_u32(t, n_layer);
+        put_u32(t, n_expert);
+        put_u64(t, table_bytes());
+        put_u64(t, file_size());
+        put_u64(t, gguf.size());
+        put_u64(t, head);
+        uint8_t sum[32];
+        llama_expert_sha256(gguf.data(), head, sum);
+        t.insert(t.end(), sum, sum + 32);
+        t.resize(128);
+        for (const auto & lt : stacked) {
+            for (const auto & r : lt) {
+                put_u64(t, r.offset);
+                put_u64(t, r.row_bytes);
+                put_u32(t, r.type);
+                put_u32(t, 0);
+            }
+        }
+        for (int il = 0; il < n_layer; ++il) {
+            for (int e = 0; e < n_expert; ++e) {
+                put_u64(t, data_start() + ((size_t) il*n_expert + e)*extent());
+            }
+        }
+        seal(t);
+        return t;
+    }
+
+    void write_gguf() const {
+        std::ofstream(gguf_path, std::ios::binary).write((const char *) gguf.data(), (std::streamsize) gguf.size());
+    }
+
+    // the side-file with the table t; data as the format says, or its first size bytes
+    void write_side(const std::vector<uint8_t> & t, size_t size) const {
+        std::vector<uint8_t> f(file_size());
+        memcpy(f.data(), t.data(), std::min(t.size(), f.size()));
+        for (int il = 0; il < n_layer; ++il) {
+            for (int e = 0; e < n_expert; ++e) {
+                size_t at = data_start() + ((size_t) il*n_expert + e)*extent();
+                for (int k = 0; k < 3; ++k) {
+                    const auto & r = stacked[il][k];
+                    memcpy(&f[at], &gguf[r.offset + e*r.row_bytes], r.row_bytes);
+                    at += r.row_bytes;
+                }
+            }
+        }
+        f.resize(size);
+        std::ofstream(side_path, std::ios::binary).write((const char *) f.data(), (std::streamsize) f.size());
+    }
+    void write_side() const { write_side(table, file_size()); }
+};
+
+// a model load's check: the error says what failed, and nothing else opens
+static std::string refusal(const sidefile_fixture & x, int fd_gguf) {
+    try {
+        llama_expert_sidefile side(x.side_path, x.stacked, sidefile_fixture::n_expert, fd_gguf, false);
+    } catch (const std::exception & e) {
+        return e.what();
+    }
+    return "";
+}
+
+// each of the three tensors receives the GGUF path's bytes on both paths; one read against three
+static void test_sidefile_slots() {
+    sidefile_fixture x;
+    const int fd = open(x.gguf_path.c_str(), O_RDONLY);
+    CHECK(fd >= 0);
+    for (const bool buffered : {false, true}) {
+        llama_expert_sidefile side(x.side_path, x.stacked, sidefile_fixture::n_expert, fd, buffered);
+        CHECK(side.alignment() == sidefile_fixture::align && side.max_extent() == x.extent());
+        std::vector<uint8_t> a[3], b[3];
+        for (int il = 0; il < sidefile_fixture::n_layer; ++il) {
+            for (int e = 0; e < sidefile_fixture::n_expert; ++e) {
+                char * pa[3], * pb[3];
+                for (int k = 0; k < 3; ++k) {
+                    const auto n = x.stacked[il][k].row_bytes;
+                    a[k].assign(n + 2, 0xEE); // guards: a row must not run over its slot
+                    b[k].assign(n + 2, 0xEE);
+                    pa[k] = (char *) a[k].data() + 1;
+                    pb[k] = (char *) b[k].data() + 1;
+                }
+                uint64_t reads_gguf = 0, reads_side = 0;
+                CHECK(llama_expert_read_rows(fd, x.gguf_path, x.stacked[il], e, pa, reads_gguf));
+                CHECK(side.read(il, e, pb, reads_side));
+                CHECK(reads_gguf == 3 && reads_side == 1);
+                for (int k = 0; k < 3; ++k) {
+                    const auto & r = x.stacked[il][k];
+                    CHECK(a[k] == b[k] && a[k].front() == 0xEE && a[k].back() == 0xEE);
+                    CHECK(memcmp(pa[k], &x.gguf[r.offset + e*r.row_bytes], r.row_bytes) == 0);
+                }
+            }
+        }
+        // several threads read concurrently into their own staging buffers
+        std::atomic<int> bad{0};
+        std::vector<std::thread> threads;
+        for (int th = 0; th < 4; ++th) {
+            threads.emplace_back([&, th] {
+                std::vector<uint8_t> g(sidefile_fixture::row_gate), u(sidefile_fixture::row_gate), d(sidefile_fixture::row_down);
+                char * dst[3] = { (char *) g.data(), (char *) u.data(), (char *) d.data() };
+                for (int i = 0; i < 200; ++i) {
+                    const int il = (th + i) % sidefile_fixture::n_layer;
+                    const int e  = (th*3 + i) % sidefile_fixture::n_expert;
+                    uint64_t reads = 0;
+                    const auto & r = x.stacked[il];
+                    if (!side.read(il, e, dst, reads) || reads != 1 ||
+                        memcmp(dst[2], &x.gguf[r[2].offset + e*r[2].row_bytes], r[2].row_bytes) != 0) {
+                        bad++;
+                    }
+                }
+            });
+        }
+        for (auto & t : threads) {
+            t.join();
+        }
+        CHECK(bad == 0);
+    }
+    close(fd);
+}
+
+// a read past the end of the file fails
+static void test_sidefile_read_failure() {
+    sidefile_fixture x;
+    const int fd = open(x.gguf_path.c_str(), O_RDONLY);
+    CHECK(fd >= 0);
+    {
+        llama_expert_sidefile side(x.side_path, x.stacked, sidefile_fixture::n_expert, fd, false);
+        CHECK(truncate(x.side_path.c_str(), (off_t) x.data_start()) == 0);
+        std::vector<uint8_t> g(sidefile_fixture::row_gate), u(sidefile_fixture::row_gate), d(sidefile_fixture::row_down);
+        char * dst[3] = { (char *) g.data(), (char *) u.data(), (char *) d.data() };
+        uint64_t reads = 0;
+        CHECK(!side.read(0, 0, dst, reads));
+        CHECK(reads == 1);
+    }
+    close(fd);
+}
+
+// every wrong table is refused, by name of what is wrong
+static void test_sidefile_refusals() {
+    sidefile_fixture x;
+    const int fd = open(x.gguf_path.c_str(), O_RDONLY);
+    CHECK(fd >= 0);
+    CHECK(refusal(x, fd).empty());
+
+    const auto with_table = [&](const std::function<void(std::vector<uint8_t> &)> & edit, bool seal = true) {
+        auto t = x.table;
+        edit(t);
+        if (seal) {
+            sidefile_fixture::seal(t);
+        }
+        x.write_side(t, x.file_size());
+    };
+    const auto expect = [&](const char * what, const char * needle) {
+        const std::string msg = refusal(x, fd);
+        if (msg.find(needle) == std::string::npos) {
+            fprintf(stderr, "%s:%d: FAIL %s: refusal \"%s\", want \"%s\"\n", __FILE__, __LINE__, what, msg.c_str(), needle);
+            n_failed++;
+        }
+    };
+    using F = sidefile_fixture;
+
+    with_table([](std::vector<uint8_t> & t) { t[200] ^= 1; }, false);
+    expect("a flipped byte in the tensor table, checksum left", "table checksum");
+    with_table([&](std::vector<uint8_t> & t) { t[F::table_bytes_of() - 1] ^= 1; }, false);
+    expect("a flipped byte in the offsets, checksum left", "table checksum");
+    with_table([](std::vector<uint8_t> & t) { t[90] ^= 1; }, false);
+    expect("a flipped byte in the checksum", "table checksum");
+    with_table([](std::vector<uint8_t> & t) { t[0] ^= 1; });
+    expect("bad magic", "bad magic");
+    with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 8, F::version_next()); });
+    expect("a version from the future", "version");
+    with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 16, F::n_layer - 1); });
+    expect("fewer layers", "layers, the model has");
+    with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 20, F::n_expert + 1); });
+    expect("more experts", "experts per layer, the model has");
+    with_table([](std::vector<uint8_t> & t) { F::set_u64(t, 24, F::table_bytes_of() + 8); });
+    expect("a table of another length", "table of");
+    with_table([&](std::vector<uint8_t> & t) { F::set_u64(t, 32, x.file_size() + F::align); });
+    expect("a larger file size in the table", "file size");
+    with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 12, 512); });
+    expect("an alignment below the device's", "alignment");
+    with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 12, 20000); });
+    expect("an alignment that is not a power of two", "alignment");
+    with_table([](std::vector<uint8_t> & t) { F::set_u64(t, 128 + 8, F::row_gate + 1); });
+    expect("another row size", "row bytes");
+    with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 128 + 2*24 + 16, 18); });
+    expect("another type for down", "ggml type");
+    with_table([](std::vector<uint8_t> & t) { F::set_u64(t, 128, F::head + 8); });
+    expect("another GGUF offset", "GGUF offset");
+    with_table([&](std::vector<uint8_t> & t) { F::set_u64(t, x.offset_at(0, 1), x.data_start() + x.extent() + 1); });
+    expect("a misaligned extent", "not aligned");
+    with_table([&](std::vector<uint8_t> & t) { F::set_u64(t, x.offset_at(0, 0), 0); });
+    expect("an extent over the table", "out of range");
+    with_table([&](std::vector<uint8_t> & t) { F::set_u64(t, x.offset_at(2, 7), x.file_size()); });
+    expect("an extent past the end", "out of range");
+    with_table([&](std::vector<uint8_t> & t) { F::set_u64(t, x.offset_at(1, 3), ~(uint64_t) 0 - F::align + 1); });
+    expect("an extent whose end overflows", "out of range");
+    with_table([&](std::vector<uint8_t> & t) { F::set_u64(t, x.offset_at(1, 3), x.data_start() + 2*x.extent()); });
+    expect("two experts in one extent", "overlaps");
+    with_table([](std::vector<uint8_t> & t) { F::set_u64(t, 40, F::head + 1); });
+    expect("another GGUF's size", "another GGUF");
+    with_table([](std::vector<uint8_t> & t) { t[56] ^= 1; });
+    expect("another GGUF's header", "another GGUF");
+
+    // a truncated or extended file, with a good table
+    x.write_side(x.table, x.file_size() - F::align);
+    expect("a truncated file", "file size");
+    x.write_side(x.table, x.table_bytes() - 1);
+    expect("a truncated table", "shorter than its table");
+    x.write_side(x.table, 100);
+    expect("a truncated header", "too short");
+    x.write_side();
+    CHECK(truncate(x.side_path.c_str(), (off_t) (x.file_size() + 4096)) == 0);
+    expect("an extended file", "file size");
+    x.write_side();
+    CHECK(refusal(x, fd).empty());
+
+    // the GGUF's identity, read from the file itself
+    close(fd);
+    auto header_changed = x.gguf;
+    header_changed[10] ^= 1;
+    std::ofstream(x.gguf_path, std::ios::binary).write((const char *) header_changed.data(), (std::streamsize) header_changed.size());
+    int fd2 = open(x.gguf_path.c_str(), O_RDONLY);
+    CHECK(refusal(x, fd2).find("another GGUF") != std::string::npos);
+    close(fd2);
+
+    // no file at all: no fallback
+    unlink(x.side_path.c_str());
+    {
+        x.write_gguf();
+        fd2 = open(x.gguf_path.c_str(), O_RDONLY);
+        const std::string msg = refusal(x, fd2);
+        CHECK(msg.find("cannot open") != std::string::npos && msg.find("no fallback") != std::string::npos);
+        close(fd2);
+    }
+}
+
+// --sidefile: a real pair, as described at the top
+static int test_sidefile_pair(const char * gguf_path, const char * side_path, int per_layer) {
+    ggml_context * ctx = nullptr;
+    gguf_init_params ip = { /*.no_alloc =*/ true, /*.ctx =*/ &ctx };
+    gguf_context * g = gguf_init_from_file(gguf_path, ip);
+    if (!g) {
+        fprintf(stderr, "cannot read %s\n", gguf_path);
+        return 1;
+    }
+    const int64_t arch_key = gguf_find_key(g, "general.architecture");
+    const std::string arch = gguf_get_val_str(g, arch_key);
+    const int n_layer = (int) gguf_get_val_u32(g, gguf_find_key(g, (arch + ".block_count").c_str()));
+    int n_expert = 0;
+    std::vector<std::array<llama_expert_stacked, 3>> stacked(n_layer);
+    static const char * kinds[3] = { "gate", "up", "down" };
+    for (int il = 0; il < n_layer; ++il) {
+        for (int k = 0; k < 3; ++k) {
+            const std::string name = "blk." + std::to_string(il) + ".ffn_" + kinds[k] + "_exps.weight";
+            const int64_t id = gguf_find_tensor(g, name.c_str());
+            const ggml_tensor * t = ggml_get_tensor(ctx, name.c_str());
+            if (id < 0 || !t) {
+                fprintf(stderr, "no tensor %s\n", name.c_str());
+                return 1;
+            }
+            n_expert = (int) t->ne[2];
+            // as llama_model_loader's weight and the cache's slot tensor compute them
+            stacked[il][k] = { (uint64_t) (gguf_get_data_offset(g) + gguf_get_tensor_offset(g, id)),
+                               (uint64_t) ggml_row_size(t->type, t->ne[0]) * (uint64_t) t->ne[1], (uint32_t) t->type };
+        }
+    }
+    const int fd = open(gguf_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "cannot open %s\n", gguf_path);
+        return 1;
+    }
+    int failed = 0;
+    uint64_t experts = 0, reads_gguf = 0, reads_side = 0, bytes = 0;
+    try {
+        llama_expert_sidefile side(side_path, stacked, n_expert, fd, false);
+        const int step = per_layer > 0 ? std::max(1, n_expert / per_layer) : 1;
+        for (int il = 0; il < n_layer; ++il) {
+            std::vector<uint8_t> a[3], b[3];
+            char * pa[3], * pb[3];
+            for (int k = 0; k < 3; ++k) {
+                a[k].resize(stacked[il][k].row_bytes);
+                b[k].resize(stacked[il][k].row_bytes);
+                pa[k] = (char *) a[k].data();
+                pb[k] = (char *) b[k].data();
+            }
+            // the first and the last expert of each layer, always
+            for (int e = 0; e < n_expert; e = (e + step < n_expert || e == n_expert - 1) ? e + step : n_expert - 1) {
+                const uint64_t r0 = reads_gguf, r1 = reads_side;
+                if (!llama_expert_read_rows(fd, gguf_path, stacked[il], e, pa, reads_gguf) || !side.read(il, e, pb, reads_side)) {
+                    fprintf(stderr, "layer %d expert %d: read failed\n", il, e);
+                    failed++;
+                    continue;
+                }
+                experts++;
+                for (int k = 0; k < 3; ++k) {
+                    bytes += a[k].size();
+                    if (a[k] != b[k]) {
+                        fprintf(stderr, "layer %d expert %d %s: bytes differ\n", il, e, kinds[k]);
+                        failed++;
+                    }
+                }
+                if (reads_gguf - r0 != 3 || reads_side - r1 != 1) {
+                    fprintf(stderr, "layer %d expert %d: %llu and %llu preads\n", il, e,
+                        (unsigned long long) (reads_gguf - r0), (unsigned long long) (reads_side - r1));
+                    failed++;
+                }
+            }
+        }
+    } catch (const std::exception & e) {
+        fprintf(stderr, "refused: %s\n", e.what());
+        failed++;
+    }
+    close(fd);
+    gguf_free(g);
+    ggml_free(ctx);
+    printf("sidefile pair: %llu experts of %d layers x %d, %llu bytes, %llu preads from the GGUF, %llu from the side-file, %d differences\n",
+        (unsigned long long) experts, n_layer, n_expert, (unsigned long long) bytes, (unsigned long long) reads_gguf, (unsigned long long) reads_side, failed);
+    return failed > 0 ? 1 : 0;
+}
+#endif
+
 static void test_top_k() {
     std::vector<int> out;
     llama_expert_top_k({0.5, 2.0, 1.0, 2.0, 0.0}, 3, out);
@@ -346,6 +846,11 @@ static void test_markov_fixture(const char * path) {
 }
 
 int main(int argc, char ** argv) {
+#ifdef HAVE_SIDEFILE_TESTS
+    if (argc >= 4 && strcmp(argv[1], "--sidefile") == 0) {
+        return test_sidefile_pair(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 0);
+    }
+#endif
     test_lru();
     test_pinned();
     test_pinned_loading();
@@ -355,7 +860,15 @@ int main(int argc, char ** argv) {
     test_in_flight();
     test_failures();
     test_stress();
+    test_concurrent_misses();
+    test_preads_counted();
     test_top_k();
+    test_sha256();
+#ifdef HAVE_SIDEFILE_TESTS
+    test_sidefile_slots();
+    test_sidefile_read_failure();
+    test_sidefile_refusals();
+#endif
     if (argc > 1) {
         test_markov_fixture(argv[1]);
     } else {

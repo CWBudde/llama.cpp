@@ -29,6 +29,8 @@ struct llama_expert_cache_counts {
     uint64_t prefetch_cancelled = 0; // dropped from the queue before it started
     uint64_t prefetch_skipped   = 0; // not issued: resident or loading already, or its layer in flight
     uint64_t load_failures      = 0;
+    uint64_t loads  = 0; // experts read into a slot
+    uint64_t preads = 0; // the system calls those reads took, failed loads included
     double   wait_seconds = 0; // remaps blocked on loads: the cost on the critical path
     double   io_seconds   = 0; // the loads' own durations, summed over the I/O threads
     double   io_prefetch_seconds = 0; // the part of io_seconds that prefetches took: overlapped with
@@ -36,8 +38,9 @@ struct llama_expert_cache_counts {
 };
 
 struct llama_expert_slots {
-    // load(layer, expert, slot) reads one expert into one slot and returns false on failure
-    using load_fn = std::function<bool(int layer, int expert, int slot)>;
+    // load(layer, expert, slot, preads) reads one expert into one slot, adds its read calls to
+    // preads and returns false on failure
+    using load_fn = std::function<bool(int layer, int expert, int slot, uint64_t & preads)>;
 
     llama_expert_slots(std::vector<int> n_slots, int n_expert, std::vector<size_t> expert_bytes, int n_threads, load_fn load);
     ~llama_expert_slots();

@@ -283,18 +283,21 @@ void llama_expert_slots::worker() {
         // the slot is loading and in no queue: no remap, prefetch or cancellation touches it now
         lock.unlock();
         const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = load(j.l, e, j.slot);
+        uint64_t preads = 0;
+        const bool ok = load(j.l, e, j.slot, preads);
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         lock.lock();
 
         running--;
         auto & c = counts_of(decode);
         c.io_seconds += dt;
+        c.preads     += preads;
         if (!demand) {
             c.io_prefetch_seconds += dt;
         }
         if (ok) {
             x.state = READY;
+            c.loads++;
             (demand ? c.demand_bytes : c.prefetch_bytes) += expert_bytes[j.l];
         } else {
             c.load_failures++;
