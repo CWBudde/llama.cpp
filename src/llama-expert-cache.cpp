@@ -111,14 +111,14 @@ std::string counts_json(const llama_expert_cache_counts & c, const std::string &
         "\"evictions\": %llu, \"demand_bytes\": %llu, \"prefetch_bytes\": %llu, \"prefetch_issued\": %llu, "
         "\"prefetch_used\": %llu, \"prefetch_wasted\": %llu, \"prefetch_cancelled\": %llu, "
         "\"prefetch_skipped\": %llu, \"load_failures\": %llu, \"wait_seconds\": %.6f, \"io_seconds\": %.6f, "
-        "\"io_prefetch_seconds\": %.6f%s}",
+        "\"io_prefetch_seconds\": %.6f, \"loads\": %llu, \"preads\": %llu%s}",
         (unsigned long long) c.steps, (unsigned long long) c.needed, (unsigned long long) c.hits,
         (unsigned long long) c.hits_loading, (unsigned long long) c.misses, (unsigned long long) c.evictions,
         (unsigned long long) c.demand_bytes, (unsigned long long) c.prefetch_bytes,
         (unsigned long long) c.prefetch_issued, (unsigned long long) c.prefetch_used,
         (unsigned long long) c.prefetch_wasted, (unsigned long long) c.prefetch_cancelled,
         (unsigned long long) c.prefetch_skipped, (unsigned long long) c.load_failures, c.wait_seconds, c.io_seconds,
-        c.io_prefetch_seconds, extra.c_str());
+        c.io_prefetch_seconds, (unsigned long long) c.loads, (unsigned long long) c.preads, extra.c_str());
 }
 
 std::string process_json(const process_counts & pc, uint64_t disk_read0, uint64_t pageins0, uint64_t faults0) {
@@ -174,7 +174,7 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int 
     : n_layer(n_layer), n_expert(n_expert), n_expert_used(n_expert_used),
       n_threads(std::max(p.n_threads, 1)), prefetch_k(std::max(p.prefetch_k, 0)),
       prefetch_half_life(std::max(p.prefetch_half_life, 1)), prefetch_mix(p.prefetch_mix),
-      stats_path(p.stats_path ? p.stats_path : ""), buffered(p.buffered) {
+      stats_path(p.stats_path ? p.stats_path : ""), buffered(p.buffered), sidefile_path(p.sidefile_path ? p.sidefile_path : "") {
     if (p.n_slots_layer && p.n_layer_slots > 0) {
         if (p.n_layer_slots != n_layer) {
             throw std::runtime_error(format("expert cache: %d per-layer slot counts for %d layers", p.n_layer_slots, n_layer));
@@ -381,12 +381,23 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
     }
 #endif
 
+    rows.resize(n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        for (int k = 0; k < 3; ++k) {
+            const ggml_tensor * t = slot_t[il].t[k];
+            rows[il][k] = { (uint64_t) stacked[il].offs[k], (uint64_t) t->nb[2], (uint32_t) t->type };
+        }
+    }
+    if (!sidefile_path.empty()) {
+        sidefile = std::make_unique<llama_expert_sidefile>(sidefile_path, rows, n_expert, fd, buffered);
+    }
+
     ud.resize(n_layer);
     for (int il = 0; il < n_layer; ++il) {
         ud[il] = { this, il };
     }
     slots = std::make_unique<llama_expert_slots>(n_slots, n_expert, expert_bytes, n_threads,
-        [this](int il, int e, int s) { return load(il, e, s); });
+        [this](int il, int e, int s, uint64_t & preads) { return load(il, e, s, preads); });
     if (prefetch_k > 0) {
         markov = std::make_unique<llama_expert_markov>(n_layer, n_expert, prefetch_half_life, prefetch_mix);
     }
@@ -405,7 +416,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
     }
     LLAMA_LOG_INFO("%s: %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, reading %s%s\n",
         __func__, *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
-        n_expert, where.c_str(), n_threads, pf.c_str(), path.c_str(), buffered ? " (buffered)" : "");
+        n_expert, where.c_str(), n_threads, pf.c_str(), sidefile ? sidefile_path.c_str() : path.c_str(), buffered ? " (buffered)" : "");
 }
 
 uint32_t llama_expert_cache::max_ubatch() const {
@@ -446,7 +457,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
         int l = -1;
         int e = -1;
         if (slots->failure(l, e)) {
-            GGML_ABORT("expert cache: reading expert %d of layer %d from %s failed", e, l, path.c_str());
+            GGML_ABORT("expert cache: reading expert %d of layer %d from %s failed", e, l, sidefile ? sidefile_path.c_str() : path.c_str());
         }
         GGML_ABORT("expert cache: layer %d needs more distinct experts in one ubatch of %d tokens than its %d slots",
             il, n_tokens, n_slots[il]);
@@ -463,34 +474,16 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
     op_seconds[decode] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
-bool llama_expert_cache::load(int il, int e, int s) {
-#if defined(__APPLE__) || defined(__linux__)
+bool llama_expert_cache::load(int il, int e, int s, uint64_t & preads) {
+    char * dst[3];
     for (int k = 0; k < 3; ++k) {
         const ggml_tensor * t = slot_t[il].t[k];
-        const size_t n   = t->nb[2];
-        char *       dst = (char *) t->data + (size_t) s*n;
-        const off_t  off = (off_t) (stacked[il].offs[k] + (size_t) e*n);
-        size_t done = 0;
-        while (done < n) {
-            const ssize_t r = pread(fd, dst + done, n - done, off + (off_t) done);
-            if (r <= 0) {
-                if (r < 0 && errno == EINTR) {
-                    continue;
-                }
-                LLAMA_LOG_ERROR("%s: pread of %zu bytes at %lld in %s: %s\n", __func__, n - done,
-                    (long long) (off + (off_t) done), path.c_str(), r < 0 ? strerror(errno) : "end of file");
-                return false;
-            }
-            done += (size_t) r;
-        }
+        dst[k] = (char *) t->data + (size_t) s*t->nb[2];
     }
-    return true;
-#else
-    GGML_UNUSED(il);
-    GGML_UNUSED(e);
-    GGML_UNUSED(s);
-    return false;
-#endif
+    if (sidefile) {
+        return sidefile->read(il, e, dst, preads);
+    }
+    return llama_expert_read_rows(fd, path, rows[il], e, dst, preads);
 }
 
 std::string llama_expert_cache::stats_json() const {
@@ -505,10 +498,11 @@ std::string llama_expert_cache::stats_json() const {
     const std::string x_dec = remap(op_seconds[1], c_dec.wait_seconds) + (diag ? ", " + diag->json_fields() : std::string());
     return format(
         "{\"expert_cache\": {\"slots_min\": %d, \"slots_max\": %d, \"slot_bytes\": %zu, \"expert_bytes\": %zu, "
-        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"buffered\": %s, \"file\": %s}, "
+        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"buffered\": %s, \"file\": %s, \"sidefile\": %s}, "
         "\"prefill\": %s, \"decode\": %s, \"process\": %s}",
         s_min, s_max, slot_bytes(), expert_bytes.empty() ? (size_t) 0 : expert_bytes[0],
         n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, buffered ? "true" : "false", json_string(path).c_str(),
+        sidefile ? json_string(sidefile_path).c_str() : "null",
         counts_json(c_pre, x_pre).c_str(), counts_json(c_dec, x_dec).c_str(),
         process_json(pc, disk_read0, pageins0, faults0).c_str());
 }

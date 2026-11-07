@@ -1598,6 +1598,10 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
+    if (!expert_cache_requested() && params.expert_cache && params.expert_cache->sidefile_path && *params.expert_cache->sidefile_path) {
+        throw std::runtime_error(format("expert cache: side-file %s given without the cache (--expert-cache)", params.expert_cache->sidefile_path));
+    }
+
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
     const auto & tensor_split = params.tensor_split;
@@ -3457,6 +3461,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
         /*.prefetch_mix       =*/ 0.75f,
         /*.stats_path         =*/ nullptr,
         /*.buffered           =*/ false,
+        /*.sidefile_path      =*/ nullptr,
     };
 
     return result;

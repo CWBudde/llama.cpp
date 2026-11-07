@@ -1710,7 +1710,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     // without the cache, --expert-cache-stats still asks for the decode timing of the resident model
-    if (params.expert_cache > 0 || !params.expert_cache_layers.empty() || !params.expert_cache_stats.empty()) {
+    if (params.expert_cache > 0 || !params.expert_cache_layers.empty() || !params.expert_cache_stats.empty() || !params.expert_cache_sidefile.empty()) {
         auto & ec = params.expert_cache_lp;
         ec = llama_expert_cache_default_params();
         ec.n_slots            = params.expert_cache;
@@ -1722,6 +1722,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         ec.prefetch_mix       = params.expert_prefetch_mix;
         ec.stats_path         = params.expert_cache_stats.empty() ? nullptr : params.expert_cache_stats.c_str();
         ec.buffered           = params.expert_cache_buffered;
+        ec.sidefile_path      = params.expert_cache_sidefile.empty() ? nullptr : params.expert_cache_sidefile.c_str();
         mparams.expert_cache  = &ec;
     }
 

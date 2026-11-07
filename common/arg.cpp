@@ -2844,6 +2844,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_BUFFERED"));
     add_opt(common_arg(
+        {"--expert-cache-sidefile"}, "FNAME",
+        "[EXPERIMENTAL] read the expert cache's misses from this side-file, written by kolibri-sidefile, with one read per expert instead of three; the load fails if its table does not match the model and the GGUF (it does not hash the data: kolibri-sidefile verify does)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_sidefile = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_SIDEFILE"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {
