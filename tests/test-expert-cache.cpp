@@ -680,6 +680,8 @@ static void test_sidefile_refusals() {
     expect("a table of another length", "table of");
     with_table([&](std::vector<uint8_t> & t) { F::set_u64(t, 32, x.file_size() + F::align); });
     expect("a larger file size in the table", "file size");
+    with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 12, 0); });
+    expect("an alignment of zero, which the extents divide by", "alignment");
     with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 12, 512); });
     expect("an alignment below the device's", "alignment");
     with_table([](std::vector<uint8_t> & t) { F::set_u32(t, 12, 20000); });
