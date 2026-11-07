@@ -611,6 +611,32 @@ static void test_sidefile_read_failure() {
 }
 
 // every wrong table is refused, by name of what is wrong
+// in pieces or at once, across the piece size
+static void test_sha256_file() {
+    const char * tmp = getenv("TMPDIR");
+    std::string path = std::string(tmp ? tmp : "/tmp") + "/test-expert-sha256-XXXXXX";
+    const int fd = mkstemp(path.data());
+    CHECK(fd >= 0);
+    const size_t piece = 1024*1024;
+    std::vector<uint8_t> data(3*piece + 17);
+    std::mt19937 rng(7);
+    for (auto & b : data) {
+        b = (uint8_t) rng();
+    }
+    CHECK(write(fd, data.data(), data.size()) == (ssize_t) data.size());
+    for (const size_t n : { (size_t) 0, (size_t) 1, (size_t) 55, (size_t) 56, (size_t) 63, (size_t) 64, (size_t) 65,
+                            piece - 1, piece, piece + 1, 2*piece, data.size() }) {
+        uint8_t want[32], got[32];
+        llama_expert_sha256(data.data(), n, want);
+        CHECK(llama_expert_sha256_file(fd, n, got));
+        CHECK(hex32(want) == hex32(got));
+    }
+    uint8_t got[32];
+    CHECK(!llama_expert_sha256_file(fd, data.size() + 1, got));
+    close(fd);
+    unlink(path.c_str());
+}
+
 static void test_sidefile_refusals() {
     sidefile_fixture x;
     const int fd = open(x.gguf_path.c_str(), O_RDONLY);
@@ -676,6 +702,13 @@ static void test_sidefile_refusals() {
     expect("another GGUF's size", "another GGUF");
     with_table([](std::vector<uint8_t> & t) { t[56] ^= 1; });
     expect("another GGUF's header", "another GGUF");
+    // the table is checksummed, so this is what a crafted one says; nothing the size of the claim is allocated
+    with_table([&](std::vector<uint8_t> & t) { F::set_u64(t, 48, x.gguf.size()); });
+    expect("a GGUF header as long as the GGUF", "reaches into the experts");
+    with_table([](std::vector<uint8_t> & t) { F::set_u64(t, 48, F::head + 1); });
+    expect("a GGUF header one byte into the experts", "reaches into the experts");
+    with_table([](std::vector<uint8_t> & t) { F::set_u64(t, 48, F::head - 1); });
+    expect("a shorter GGUF header", "another GGUF");
 
     // a truncated or extended file, with a good table
     x.write_side(x.table, x.file_size() - F::align);
@@ -867,6 +900,7 @@ int main(int argc, char ** argv) {
 #ifdef HAVE_SIDEFILE_TESTS
     test_sidefile_slots();
     test_sidefile_read_failure();
+    test_sha256_file();
     test_sidefile_refusals();
 #endif
     if (argc > 1) {

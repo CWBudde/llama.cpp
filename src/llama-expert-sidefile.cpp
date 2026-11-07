@@ -121,20 +121,19 @@ struct staging {
 
 } // namespace
 
-void llama_expert_sha256(const void * data, size_t n, uint8_t out[32]) {
-    uint32_t h[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
-    const uint8_t * p = (const uint8_t *) data;
-    size_t left = n;
-    for (; left >= 64; left -= 64, p += 64) {
-        sha256_block(h, p);
-    }
+namespace {
+
+constexpr uint32_t sha256_start[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+
+// the last left < 64 of n bytes at p, the padding, and the digest
+void sha256_finish(uint32_t h[8], const uint8_t * p, size_t left, uint64_t n, uint8_t out[32]) {
     uint8_t tail[128] = {};
     if (left > 0) {
         memcpy(tail, p, left);
     }
     tail[left] = 0x80;
     const size_t blocks = left + 9 <= 64 ? 1 : 2;
-    const uint64_t bits = (uint64_t) n * 8;
+    const uint64_t bits = n * 8;
     for (int i = 0; i < 8; ++i) {
         tail[blocks*64 - 1 - i] = (uint8_t) (bits >> (8*i));
     }
@@ -146,6 +145,56 @@ void llama_expert_sha256(const void * data, size_t n, uint8_t out[32]) {
             out[4*i + j] = (uint8_t) (h[i] >> (24 - 8*j));
         }
     }
+}
+
+} // namespace
+
+void llama_expert_sha256(const void * data, size_t n, uint8_t out[32]) {
+    uint32_t h[8];
+    memcpy(h, sha256_start, sizeof(h));
+    const uint8_t * p = (const uint8_t *) data;
+    size_t left = n;
+    for (; left >= 64; left -= 64, p += 64) {
+        sha256_block(h, p);
+    }
+    sha256_finish(h, p, left, n, out);
+}
+
+bool llama_expert_sha256_file(int fd, uint64_t n, uint8_t out[32]) {
+#if defined(__APPLE__) || defined(__linux__)
+    uint32_t h[8];
+    memcpy(h, sha256_start, sizeof(h));
+    std::vector<uint8_t> piece(1024*1024); // whole blocks, so only the last piece leaves a tail
+    uint64_t done = 0;
+    while (true) {
+        const size_t want = (size_t) std::min<uint64_t>(n - done, piece.size());
+        size_t got = 0;
+        while (got < want) {
+            const ssize_t r = pread(fd, piece.data() + got, want - got, (off_t) (done + got));
+            if (r < 0 && errno == EINTR) {
+                continue;
+            }
+            if (r <= 0) {
+                return false;
+            }
+            got += (size_t) r;
+        }
+        const size_t whole = want/64*64;
+        for (size_t i = 0; i < whole; i += 64) {
+            sha256_block(h, piece.data() + i);
+        }
+        done += want;
+        if (done == n) {
+            sha256_finish(h, piece.data() + whole, want - whole, n, out);
+            return true;
+        }
+    }
+#else
+    GGML_UNUSED(fd);
+    GGML_UNUSED(n);
+    GGML_UNUSED(out);
+    return false;
+#endif
 }
 
 bool llama_expert_read_rows(int fd, const std::string & path, const std::array<llama_expert_stacked, 3> & stacked, int e,
@@ -332,14 +381,20 @@ llama_expert_sidefile::llama_expert_sidefile(const std::string & path_in, const 
         if ((uint64_t) sg.st_size != gguf_size) {
             throw fail(format("written from another GGUF: its size was %llu, this one has %llu", (unsigned long long) gguf_size, (unsigned long long) sg.st_size));
         }
-        if (gguf_head > gguf_size) {
-            throw fail(format("GGUF header of %llu bytes in a GGUF of %llu", (unsigned long long) gguf_head, (unsigned long long) gguf_size));
+        // the table is the file's word for this length: it may size no allocation, and a real header
+        // ends before the data section, so before the experts
+        uint64_t first_row = gguf_size;
+        for (const auto & lt : stacked) {
+            for (const auto & st : lt) {
+                first_row = std::min(first_row, st.offset);
+            }
         }
-        std::vector<uint8_t> head(gguf_head);
-        if (!read_at(fd_gguf, head.data(), head.size(), 0)) {
+        if (gguf_head > first_row) {
+            throw fail(format("GGUF header of %llu bytes reaches into the experts at %llu", (unsigned long long) gguf_head, (unsigned long long) first_row));
+        }
+        if (!llama_expert_sha256_file(fd_gguf, gguf_head, got)) {
             throw fail("cannot read the GGUF's header");
         }
-        llama_expert_sha256(head.data(), head.size(), got);
         if (memcmp(got, &table[56], sizeof(got)) != 0) {
             throw fail(format("written from another GGUF: its header's sha256 was %s, this one's is %s", hex(&table[56], 32).c_str(), hex(got, 32).c_str()));
         }

@@ -38,6 +38,9 @@
 // sha256 of n bytes: the side-file's table and the GGUF's header
 void llama_expert_sha256(const void * data, size_t n, uint8_t out[32]);
 
+// sha256 of a file's first n bytes, read in pieces of fixed size; false if it cannot read them all
+bool llama_expert_sha256_file(int fd, uint64_t n, uint8_t out[32]);
+
 // one stacked tensor, as the model has it
 struct llama_expert_stacked {
     uint64_t offset    = 0; // absolute offset of expert 0 in the GGUF
