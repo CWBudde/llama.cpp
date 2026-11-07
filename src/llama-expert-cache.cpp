@@ -12,8 +12,12 @@
 #include <stdexcept>
 
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <fcntl.h>
-#include <libproc.h>
+#if TARGET_OS_OSX
+#include <libproc.h> // macOS only: iOS, tvOS and visionOS do not ship it
+#define LLAMA_EXPERT_CACHE_PROC_RUSAGE
+#endif
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/resource.h>
@@ -35,7 +39,7 @@ struct process_counts {
     uint64_t pageins   = 0;
     uint64_t faults    = 0;
     uint64_t max_phys_footprint = 0;
-#if defined(__APPLE__)
+#if defined(LLAMA_EXPERT_CACHE_PROC_RUSAGE)
     static constexpr bool has_io     = true; // disk_read, pageins, max_phys_footprint
 #else
     static constexpr bool has_io     = false;
@@ -74,7 +78,7 @@ std::string json_string(const std::string & s) {
 
 process_counts process_now() {
     process_counts c;
-#if defined(__APPLE__)
+#if defined(LLAMA_EXPERT_CACHE_PROC_RUSAGE)
     rusage_info_v4 ri = {};
     if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *) &ri) == 0) {
         c.disk_read          = ri.ri_diskio_bytesread;
