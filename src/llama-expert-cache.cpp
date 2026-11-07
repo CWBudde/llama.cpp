@@ -12,16 +12,22 @@
 #include <stdexcept>
 
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <fcntl.h>
-#include <libproc.h>
+#if TARGET_OS_OSX
+#include <libproc.h> // macOS only: iOS, tvOS and visionOS do not ship it
+#define LLAMA_EXPERT_CACHE_PROC_RUSAGE
+#endif
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #elif defined(__linux__)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -33,7 +39,7 @@ struct process_counts {
     uint64_t pageins   = 0;
     uint64_t faults    = 0;
     uint64_t max_phys_footprint = 0;
-#if defined(__APPLE__)
+#if defined(LLAMA_EXPERT_CACHE_PROC_RUSAGE)
     static constexpr bool has_io     = true; // disk_read, pageins, max_phys_footprint
 #else
     static constexpr bool has_io     = false;
@@ -72,7 +78,7 @@ std::string json_string(const std::string & s) {
 
 process_counts process_now() {
     process_counts c;
-#if defined(__APPLE__)
+#if defined(LLAMA_EXPERT_CACHE_PROC_RUSAGE)
     rusage_info_v4 ri = {};
     if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *) &ri) == 0) {
         c.disk_read          = ri.ri_diskio_bytesread;
@@ -262,6 +268,17 @@ size_t llama_expert_cache::slot_bytes() const {
     return n;
 }
 
+bool llama_expert_cache::holds(const ggml_tensor * t) const {
+    for (const auto & layer : stacked) {
+        for (const ggml_tensor * s : layer.t) {
+            if (s == t) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std::vector<ggml_backend_dev_t> & devs, int fd_loader) {
     GGML_ASSERT((int) stacked_in.size() == n_layer && (int) devs.size() == n_layer);
     stacked = stacked_in;
@@ -379,6 +396,18 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
 #else
     GGML_UNUSED(fd_loader);
     throw std::runtime_error("expert cache: not supported on this platform");
+#endif
+#if defined(__APPLE__) || defined(__linux__)
+    // the cache has its own open file, since F_NOCACHE would reach the loader's through a dup. A path
+    // can name another file by now, and the offsets would read wrong weights without an error
+    struct stat st_loader = {};
+    struct stat st_own = {};
+    if (fstat(fd_loader, &st_loader) != 0 || fstat(fd, &st_own) != 0) {
+        throw std::runtime_error(format("expert cache: fstat of %s: %s", path.c_str(), strerror(errno)));
+    }
+    if (st_loader.st_dev != st_own.st_dev || st_loader.st_ino != st_own.st_ino) {
+        throw std::runtime_error(format("expert cache: %s was replaced while the model loaded", path.c_str()));
+    }
 #endif
 
     ud.resize(n_layer);
