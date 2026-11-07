@@ -458,9 +458,13 @@ void llama_expert_cache::bind_gate(ggml_tensor * mul_mat_id, int il) const {
 }
 
 void llama_expert_cache::gate_remap(int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped) {
-    if (il == 0) {
-        gate_seen = 0;
+    // A graph compute finds its own gates, so a layer cut in two gets two, and a second remap of the
+    // same layer would count and pin it twice. Hence no cut inside a layer, before that remap.
+    if (il <= gate_il) {
+        GGML_ABORT("expert cache: --expert-cache-gpu-remap: layer %d reached its Metal gate again in the same graph, after layer %d: "
+                   "a cb_eval that stops between a layer's matmuls cuts it in two, and this mode cannot run that", il, gate_il);
     }
+    gate_il = il;
     gate_seen++;
     gate_scratch.resize(n_ids);
     remap_ids(il, ids, n_ids, n_tokens, gate_scratch.data());
@@ -481,7 +485,12 @@ void llama_expert_cache::gate_check_graph(bool has_outputs) {
     if (gate_seen != want) {
         GGML_ABORT("expert cache: --expert-cache-gpu-remap: %d of %d expert layers went through the Metal gate; the others left the GPU", gate_seen, want);
     }
+    gate_abandon_graph();
+}
+
+void llama_expert_cache::gate_abandon_graph() {
     gate_seen = 0;
+    gate_il   = -1;
 }
 
 void llama_expert_cache::remap_ids(int il, const int32_t * ids, int n_ids, int n_tokens, int32_t * out) {

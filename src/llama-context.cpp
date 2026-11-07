@@ -1653,8 +1653,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // [EXPERIMENTAL] the gates ran synchronously, each layer once, or a layer left the GPU; the last
     // layer keeps only the output rows, so with no output in this ubatch it has no matmuls
-    if (status == GGML_STATUS_SUCCESS && model.expert_cache && model.expert_cache->gpu_remap()) {
-        model.expert_cache->gate_check_graph(n_outputs > 0);
+    if (model.expert_cache && model.expert_cache->gpu_remap()) {
+        if (status == GGML_STATUS_SUCCESS) {
+            model.expert_cache->gate_check_graph(n_outputs > 0);
+        } else {
+            model.expert_cache->gate_abandon_graph();
+        }
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);

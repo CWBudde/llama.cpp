@@ -102,6 +102,9 @@ struct llama_expert_cache {
     // has_outputs false: the last layer has no rows, hence no gate
     void gate_check_graph(bool has_outputs);
 
+    // after a graph that did not complete: the next one starts at layer 0 again
+    void gate_abandon_graph();
+
     ggml_tensor * gate(int il) const { return slot_t[il].t[0]; }
     ggml_tensor * up  (int il) const { return slot_t[il].t[1]; }
     ggml_tensor * down(int il) const { return slot_t[il].t[2]; }
@@ -139,6 +142,7 @@ private:
     std::vector<ggml_tensor *> gate_slots;
     std::vector<int32_t>       gate_scratch;
     int      gate_seen = 0;           // layers through their gate in this graph
+    int      gate_il   = -1;          // the last of them
     uint64_t gate_runs[2]  = {0, 0};  // command buffers per phase
     uint64_t gate_stops[2] = {0, 0};  // those a gate stopped
 
