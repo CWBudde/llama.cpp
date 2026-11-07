@@ -109,6 +109,19 @@ static void test(void) {
             const auto draft = common_base_params_to_speculative(base);
             assert(draft.n_ubatch == 8);
         }
+
+        // [EXPERIMENTAL] the expert cache is the target's: an option left on the draft would be refused
+        base.expert_cache = 128;
+        base.expert_cache_layers = {128};
+        base.expert_cache_stats = "stats.json";
+        base.expert_cache_sidefile = "experts.side";
+        {
+            const auto draft = common_base_params_to_speculative(base);
+            assert(draft.expert_cache == 0);
+            assert(draft.expert_cache_layers.empty());
+            assert(draft.expert_cache_stats.empty());
+            assert(draft.expert_cache_sidefile.empty());
+        }
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
