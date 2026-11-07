@@ -237,6 +237,17 @@ size_t llama_expert_cache::slot_bytes() const {
     return n;
 }
 
+bool llama_expert_cache::holds(const ggml_tensor * t) const {
+    for (const auto & layer : stacked) {
+        for (const ggml_tensor * s : layer.t) {
+            if (s == t) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std::vector<ggml_backend_dev_t> & devs, int fd_loader) {
     GGML_ASSERT((int) stacked_in.size() == n_layer && (int) devs.size() == n_layer);
     stacked = stacked_in;
