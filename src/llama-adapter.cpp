@@ -1,5 +1,6 @@
 #include "llama-adapter.h"
 
+#include "llama-expert-cache.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -338,6 +339,10 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         // a latent lookup table (token_embd, also the head when the output is tied) stores rotated rows, refuse it
         if (model.hdmd.inverse_blocks.count(name)) {
             throw std::runtime_error("LoRA tensor '" + name + "' targets a prism.hadamard latent lookup table, which is not supported");
+        }
+        // the expert cache's matmuls read its slot tensors under the slots' ids: the delta would be silently left out
+        if (model.expert_cache && model.expert_cache->holds(model_tensor)) {
+            throw std::runtime_error("LoRA tensor '" + name + "' targets a routed expert, which the expert cache reads from its slots: not supported");
         }
 
         auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);

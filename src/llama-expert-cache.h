@@ -76,6 +76,9 @@ struct llama_expert_cache {
     // a CPU buffer, or host memory the device uses in place (buffer_from_host_ptr, e.g. Metal).
     void init(const std::vector<tensors> & stacked, const std::vector<ggml_backend_dev_t> & devs, int fd);
 
+    // whether t is one of the stacked expert tensors this cache reads in place of the model's
+    bool holds(const ggml_tensor * t) const;
+
     // the largest ubatch whose experts always fit: the fewest slots of a layer over n_expert_used
     uint32_t max_ubatch() const;
 
