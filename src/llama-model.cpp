@@ -1728,6 +1728,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         layers.resize(n_layer_all);
 
+        // the option changes how the cache runs, and with no cache the model would load fully
+        // resident, which is what the cache is there to avoid
+        if (params.expert_cache && params.expert_cache->gpu_remap && !expert_cache_requested()) {
+            throw std::runtime_error("expert cache: --expert-cache-gpu-remap needs --expert-cache or --expert-cache-layers");
+        }
+
         if (expert_cache_requested()) {
             if (arch != LLM_ARCH_KOLIBRI1) {
                 throw std::runtime_error(format("the expert cache supports the kolibri1 architecture only, not %s", llm_arch_name(arch)));
