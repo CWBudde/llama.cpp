@@ -44,6 +44,15 @@ int llama_expert_slots::slot_of(int l, int e) const {
     return layers[l].where[e];
 }
 
+void llama_expert_slots::copy_table(int l, int32_t * table) const {
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto & L = layers[l];
+    for (int e = 0; e < n_expert; ++e) {
+        const int s = L.where[e];
+        table[e] = s >= 0 && L.slots[s].state == READY ? s : -1;
+    }
+}
+
 llama_expert_cache_counts llama_expert_slots::counts(bool decode) const {
     std::lock_guard<std::mutex> lock(mtx);
     return decode ? c_decode : c_prefill;

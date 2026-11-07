@@ -831,6 +831,13 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+
+    // [EXPERIMENTAL] the expert gate: see ggml_metal_encoder_gate_init
+    id<MTLBuffer> gate_buf;
+    uint32_t *    gate_words;
+    uint32_t      gate_cap;
+    uint32_t      gate_n;
+    bool          gate_on;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
@@ -887,7 +894,43 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
 }
 
+void ggml_metal_encoder_gate_init(ggml_metal_encoder_t encoder, void * metal_buf, uint32_t * words, uint32_t cap) {
+    encoder->gate_buf   = (id<MTLBuffer>) metal_buf;
+    encoder->gate_words = words;
+    encoder->gate_cap   = cap;
+    encoder->gate_n     = 0;
+    encoder->gate_on    = false;
+}
+
+void ggml_metal_encoder_gate_start(ggml_metal_encoder_t encoder) {
+    encoder->gate_on = true;
+}
+
+uint32_t ggml_metal_encoder_gate_next(ggml_metal_encoder_t encoder) {
+    return encoder->gate_n;
+}
+
+bool ggml_metal_encoder_gate_active(ggml_metal_encoder_t encoder) {
+    return encoder->gate_on;
+}
+
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    if (encoder->gate_on) {
+        // a gate that stops zeroes this entry, and the dispatch then does nothing
+        if (encoder->gate_n >= encoder->gate_cap) {
+            GGML_ABORT("expert gate: more than %u dispatches in one command buffer", encoder->gate_cap);
+        }
+        const uint32_t e = encoder->gate_n++;
+        uint32_t * w = encoder->gate_words + GGML_METAL_GATE_HDR + 3*e;
+        w[0] = (uint32_t) tg0;
+        w[1] = (uint32_t) tg1;
+        w[2] = (uint32_t) tg2;
+        encoder->gate_words[2] = encoder->gate_n;
+        [encoder->obj dispatchThreadgroupsWithIndirectBuffer:encoder->gate_buf
+                                        indirectBufferOffset:(GGML_METAL_GATE_HDR + 3*e)*sizeof(uint32_t)
+                                       threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+        return;
+    }
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
 

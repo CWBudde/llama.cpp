@@ -671,6 +671,14 @@ uint64_t ggml_backend_metal_get_n_commits(void) {
     return ggml_metal_get_n_commits();
 }
 
+void ggml_backend_metal_set_expert_gate(ggml_backend_t backend, const struct ggml_backend_metal_expert_gate * gate) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_set_expert_gate(ctx, gate ? gate->remap : nullptr, gate ? gate->run : nullptr, gate ? gate->user : nullptr);
+}
+
 // backend device
 
 static const char * ggml_backend_metal_device_get_name(ggml_backend_dev_t dev) {
@@ -956,6 +964,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_get_n_commits") == 0) {
         return (void *)ggml_backend_metal_get_n_commits;
+    }
+    if (strcmp(name, "ggml_backend_metal_set_expert_gate") == 0) {
+        return (void *)ggml_backend_metal_set_expert_gate;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;

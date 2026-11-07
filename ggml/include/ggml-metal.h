@@ -58,6 +58,25 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 // work excluded); also reachable through the registry as "ggml_backend_metal_get_n_commits"
 GGML_BACKEND_API uint64_t ggml_backend_metal_get_n_commits(void);
 
+// [EXPERIMENTAL] the expert cache's GPU remap: a MUL_MAT_ID whose src[3] and src[4] are set reads
+// its ids from src[3], which a gate kernel fills from the table src[4] before the layer's first
+// matmul. The gate stops the command buffer when an id has no slot; the backend then calls remap
+// with the GPU idle, and resumes at that gate. See ggml_metal_graph_compute_gated.
+//
+// remap: called in layer order, once per gate of a graph: for a gate that passed, after its run
+//        has completed (stopped false), and for a gate that stopped (stopped true), which must
+//        load the ids' experts and update the table before it returns
+// run:   called after every command buffer of a graph of n_tokens tokens; stopped says whether a
+//        gate stopped it
+struct ggml_backend_metal_expert_gate {
+    void (*remap)(void * user, int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped);
+    void (*run)  (void * user, int n_tokens, bool stopped);
+    void * user;
+};
+
+// also reachable through the registry as "ggml_backend_metal_set_expert_gate"
+GGML_BACKEND_API void ggml_backend_metal_set_expert_gate(ggml_backend_t backend, const struct ggml_backend_metal_expert_gate * gate);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
 #ifdef __cplusplus

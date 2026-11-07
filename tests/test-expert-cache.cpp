@@ -23,8 +23,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -831,6 +833,124 @@ static int test_sidefile_pair(const char * gguf_path, const char * side_path, in
     return failed > 0 ? 1 : 0;
 }
 #endif
+// the GPU remap's table: an expert's slot when the slot holds it, else -1
+static void test_gate_table() {
+    fake f(2, 4);
+    std::vector<int32_t> table(16), out;
+    auto c = make(f, 16, 2);
+    auto slot_of_table = [&](int e) { c->copy_table(0, table.data()); return table[e]; };
+
+    CHECK(slot_of_table(3) == -1); // nothing yet
+    CHECK(remap(*c, 0, {1, 2, 3, 4}, out));
+    for (int e : {1, 2, 3, 4}) {
+        const int s = slot_of_table(e);
+        CHECK(s >= 0 && f.at(0, s) == e);
+    }
+
+    // the eviction takes the expert out of the table
+    CHECK(remap(*c, 0, {2, 3, 4, 5}, out));
+    CHECK(slot_of_table(1) == -1);
+    CHECK(slot_of_table(5) >= 0 && f.at(0, slot_of_table(5)) == 5);
+
+    // a loading expert is not in the table, though it has a slot: a gate must stop there
+    f.gated.insert({0, 6});
+    CHECK(remap(*c, 1, {0}, out)); // layer 0 is no longer in flight
+    int pf = 6;
+    c->prefetch(0, &pf, 1, true);
+    f.wait_busy(0);
+    CHECK(c->slot_of(0, 6) >= 0);
+    CHECK(slot_of_table(6) == -1);
+    f.open = true;
+    c->drain();
+    CHECK(slot_of_table(6) >= 0 && f.at(0, slot_of_table(6)) == 6);
+
+    // a failed demand load leaves nothing in the table
+    f.failing.insert({0, 9});
+    CHECK(!remap(*c, 0, {9}, out));
+    CHECK(slot_of_table(9) == -1);
+}
+
+// the GPU remap defers a hit layer's bookkeeping until the command buffer has completed: it must do
+// the same as a remap per layer, and every load must find the GPU idle
+static void test_gate_deferred() {
+    const int n_layer = 8, n_slots = 12, n_expert = 64, k = 3, n_tokens = 400;
+
+    fake a(n_layer, n_slots), b(n_layer, n_slots);
+    auto ca = make(a, n_expert, 2);
+    auto cb = make(b, n_expert, 2);
+
+    std::mt19937 rng(7);
+    std::vector<std::vector<int32_t>> tables(n_layer, std::vector<int32_t>(n_expert, -1));
+
+    uint64_t n_stops = 0, n_resident_read = 0;
+    std::vector<int32_t> out;
+
+    for (int tok = 0; tok < n_tokens; ++tok) {
+        std::vector<std::vector<int32_t>> ids(n_layer);
+        for (int l = 0; l < n_layer; ++l) {
+            // skewed, so that layers hit and miss
+            while ((int) ids[l].size() < k) {
+                const int e = std::min<int>(n_expert - 1, (int) std::abs(std::normal_distribution<double>(0, 10)(rng)));
+                if (std::find(ids[l].begin(), ids[l].end(), e) == ids[l].end()) {
+                    ids[l].push_back(e);
+                }
+            }
+        }
+
+        // a remap per layer, as the CPU op does
+        for (int l = 0; l < n_layer; ++l) {
+            CHECK(remap(*ca, l, ids[l], out));
+        }
+
+        // the gates: while the "GPU runs", only the table decides, and nothing may load
+        int reported = 0;
+        for (int pos = 0; pos < n_layer;) {
+            const int n0 = b.n_loads;
+            int stop = -1;
+            for (int l = pos; l < n_layer; ++l) {
+                for (int e : ids[l]) {
+                    if (tables[l][e] < 0) {
+                        stop = l;
+                    }
+                }
+                if (stop >= 0) {
+                    break;
+                }
+                // what this layer's matmuls read is the expert itself, as long as no load runs
+                for (int e : ids[l]) {
+                    CHECK(b.at(l, tables[l][e]) == e);
+                    n_resident_read++;
+                }
+            }
+            CHECK(b.n_loads == n0);
+
+            // the buffer has completed: the bookkeeping of the layers that passed, in order
+            const int pass = stop >= 0 ? stop : n_layer;
+            for (int l = reported; l < pass; ++l) {
+                CHECK(remap(*cb, l, ids[l], out));
+            }
+            reported = std::max(reported, pass);
+            CHECK(b.n_loads == n0); // hits read nothing
+
+            if (stop >= 0) {
+                n_stops++;
+                CHECK(remap(*cb, stop, ids[stop], out));
+                cb->copy_table(stop, tables[stop].data());
+                reported = stop + 1;
+                pos = stop; // resumes at this gate, which now passes
+            } else {
+                pos = n_layer;
+            }
+        }
+    }
+    CHECK(n_stops > 0 && n_resident_read > 0);
+
+    const auto x = ca->counts(true), y = cb->counts(true);
+    CHECK(x.steps == y.steps && x.needed == y.needed && x.hits == y.hits && x.misses == y.misses);
+    CHECK(x.evictions == y.evictions && x.demand_bytes == y.demand_bytes && x.hits_loading == 0 && y.hits_loading == 0);
+    CHECK(y.misses > 0 && y.hits > 0);
+    CHECK(a.n_loads == b.n_loads && !b.overlap);
+}
 
 static void test_top_k() {
     std::vector<int> out;
@@ -912,6 +1032,8 @@ int main(int argc, char ** argv) {
     test_stress();
     test_concurrent_misses();
     test_preads_counted();
+    test_gate_table();
+    test_gate_deferred();
     test_top_k();
     test_sha256();
 #ifdef HAVE_SIDEFILE_TESTS

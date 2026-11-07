@@ -89,6 +89,18 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
+// [EXPERIMENTAL] the expert gate's words, in a shared buffer, as u32:
+// 0: a gate stopped this command buffer; 1: which gate; 2: the indirect entries in use; 3: unused;
+// from 4: one { threadgroups x, y, z } per indirect dispatch.
+#define GGML_METAL_GATE_HDR 4
+
+// from the first gate of a command buffer on, the dispatches are indirect, from the words at metal_buf
+void     ggml_metal_encoder_gate_init  (ggml_metal_encoder_t encoder, void * metal_buf, uint32_t * words, uint32_t cap);
+void     ggml_metal_encoder_gate_start (ggml_metal_encoder_t encoder);
+// the entry the next dispatch takes, 0 before gate_start
+uint32_t ggml_metal_encoder_gate_next  (ggml_metal_encoder_t encoder);
+bool     ggml_metal_encoder_gate_active(ggml_metal_encoder_t encoder);
+
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
 //
@@ -141,6 +153,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm   
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_expert_gate(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_part(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);

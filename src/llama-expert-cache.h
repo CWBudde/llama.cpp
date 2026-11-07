@@ -90,12 +90,29 @@ struct llama_expert_cache {
     // the slot ids of the router's selected experts [n_expert_used, n_tokens], from a CPU op
     ggml_tensor * build_remap(ggml_context * ctx, ggml_tensor * selected_experts, int il);
 
+    // [EXPERIMENTAL] the GPU remap (--expert-cache-gpu-remap): no CPU op; the layer's matmuls read
+    // their ids from the slot ids, which the Metal backend's gate fills from the layer's table
+    bool gpu_remap() const { return gpu_remap_on; }
+    void bind_gate(ggml_tensor * mul_mat_id, int il) const;
+
+    // the Metal backend calls these, with the GPU idle; see ggml_metal_graph_compute_gated
+    void gate_remap(int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped);
+    void gate_run(int n_tokens, bool stopped);
+
+    // after a graph with experts: every layer has been through its gate, else one left the GPU;
+    // has_outputs false: the last layer has no rows, hence no gate
+    void gate_check_graph(bool has_outputs);
+
+    // after a graph that did not complete: the next one starts at layer 0 again
+    void gate_abandon_graph();
+
     ggml_tensor * gate(int il) const { return slot_t[il].t[0]; }
     ggml_tensor * up  (int il) const { return slot_t[il].t[1]; }
     ggml_tensor * down(int il) const { return slot_t[il].t[2]; }
 
     // the remap op's work
     void remap(int il, const ggml_tensor * ids, ggml_tensor * dst);
+    void remap_ids(int il, const int32_t * ids, int n_ids, int n_tokens, int32_t * out);
 
     // the decode timing to add to the stats; the model owns it
     void set_decode_diag(const llama_decode_diag * d) { diag = d; }
@@ -114,11 +131,22 @@ private:
     std::string stats_path;
     bool buffered; // misses read through the page cache
     std::string sidefile_path;
+    bool gpu_remap_on;
 
     std::vector<tensors>  stacked;
     std::vector<tensors>  slot_t; // the slot tensors; offs unused
     std::vector<size_t>   expert_bytes; // per layer
     std::vector<layer_ud> ud;
+
+    // the GPU remap: per layer, the table {n_expert}, each expert's slot or -1, and the slot ids
+    // {n_expert_used, 2*max_ubatch}: the slot ids, then the gate's log of the router's ids
+    std::vector<ggml_tensor *> gate_table;
+    std::vector<ggml_tensor *> gate_slots;
+    std::vector<int32_t>       gate_scratch;
+    int      gate_seen = 0;           // layers through their gate in this graph
+    int      gate_il   = -1;          // the last of them
+    uint64_t gate_runs[2]  = {0, 0};  // command buffers per phase
+    uint64_t gate_stops[2] = {0, 0};  // those a gate stopped
 
     // the slots of the layers of one device
     struct group {
