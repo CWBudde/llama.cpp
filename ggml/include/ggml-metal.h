@@ -61,7 +61,7 @@ GGML_BACKEND_API uint64_t ggml_backend_metal_get_n_commits(void);
 // [EXPERIMENTAL] the expert cache's GPU remap: a MUL_MAT_ID whose src[3] and src[4] are set reads
 // its ids from src[3], which a gate kernel fills from the table src[4] before the layer's first
 // matmul. The gate stops the command buffer when an id has no slot; the backend then calls remap
-// with the GPU idle, and resumes at that gate. See the patch's comments in ggml-metal-context.m.
+// with the GPU idle, and resumes at that gate. See ggml_metal_graph_compute_gated.
 //
 // remap: called in layer order, once per gate of a graph: for a gate that passed, after its run
 //        has completed (stopped false), and for a gate that stopped (stopped true), which must

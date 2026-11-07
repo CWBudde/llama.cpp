@@ -465,9 +465,10 @@ void llama_expert_cache::gate_run(int n_tokens, bool stopped) {
     gate_stops[d] += stopped ? 1 : 0;
 }
 
-void llama_expert_cache::gate_check_graph() {
-    if (gate_seen != n_layer) {
-        GGML_ABORT("expert cache: --expert-cache-gpu-remap: %d of %d expert layers went through the Metal gate; the others left the GPU", gate_seen, n_layer);
+void llama_expert_cache::gate_check_graph(bool has_outputs) {
+    const int want = has_outputs ? n_layer : n_layer - 1;
+    if (gate_seen != want) {
+        GGML_ABORT("expert cache: --expert-cache-gpu-remap: %d of %d expert layers went through the Metal gate; the others left the GPU", gate_seen, want);
     }
     gate_seen = 0;
 }

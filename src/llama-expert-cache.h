@@ -95,8 +95,9 @@ struct llama_expert_cache {
     void gate_remap(int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped);
     void gate_run(int n_tokens, bool stopped);
 
-    // after a graph with experts: every layer has been through its gate, else one left the GPU
-    void gate_check_graph();
+    // after a graph with experts: every layer has been through its gate, else one left the GPU;
+    // has_outputs false: the last layer has no rows, hence no gate
+    void gate_check_graph(bool has_outputs);
 
     ggml_tensor * gate(int il) const { return slot_t[il].t[0]; }
     ggml_tensor * up  (int il) const { return slot_t[il].t[1]; }
