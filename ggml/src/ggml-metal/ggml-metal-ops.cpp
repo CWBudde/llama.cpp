@@ -2848,6 +2848,9 @@ static void ggml_metal_op_expert_gate(ggml_metal_op_t ctx, ggml_tensor * op, int
 
     // the log holds a ubatch's ids; the context caps the ubatch to fit
     GGML_ASSERT(ids->ne[1] <= ggml_get_op_params_i32(slots, 1));
+    // the tensor is n_expert_used wide; llama_set_warmup makes the router's ids n_expert wide, and the
+    // gate would write its slot ids and its log past the tensor
+    GGML_ASSERT(ids->ne[0] <= slots->ne[0] && "the router's ids are wider than the expert gate's slot ids (llama_set_warmup?)");
 
     const uint32_t next = ggml_metal_encoder_gate_next(enc);
 
