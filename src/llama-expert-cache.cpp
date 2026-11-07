@@ -428,7 +428,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
         int l = -1;
         int e = -1;
         if (slots->failure(l, e)) {
-            GGML_ABORT("expert cache: reading expert %d of layer %d from %s failed", e, l, path.c_str());
+            GGML_ABORT("expert cache: reading expert %d of layer %d from %s failed", e, l, sidefile ? sidefile_path.c_str() : path.c_str());
         }
         GGML_ABORT("expert cache: layer %d needs more distinct experts in one ubatch of %d tokens than its %d slots",
             il, n_tokens, n_slots[il]);
