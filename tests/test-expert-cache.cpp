@@ -15,6 +15,8 @@
 
 #include "../src/llama-expert-sidefile.h"
 #include "../src/llama-expert-slots.h"
+#include "common.h"
+#include "speculative.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -878,6 +880,19 @@ static void test_markov_fixture(const char * path) {
     printf("markov fixture: %zu steps, %zu predictions over %zu parameter sets, as the Go predictor\n", steps.size(), n_pred, j["params"].size());
 }
 
+// a draft model gets the target's params except its expert cache: Kolibri only, one context per model
+static void test_draft_params() {
+    common_params target;
+    target.expert_cache        = 128;
+    target.expert_cache_layers = { 128, 64 };
+    target.expert_cache_stats  = "stats.json";
+    const common_params draft = common_base_params_to_speculative(target);
+    CHECK(draft.expert_cache == 0);
+    CHECK(draft.expert_cache_layers.empty());
+    CHECK(draft.expert_cache_stats.empty());
+    CHECK(target.expert_cache == 128);
+}
+
 int main(int argc, char ** argv) {
 #ifdef HAVE_SIDEFILE_TESTS
     if (argc >= 4 && strcmp(argv[1], "--sidefile") == 0) {
@@ -903,6 +918,7 @@ int main(int argc, char ** argv) {
     test_sha256_file();
     test_sidefile_refusals();
 #endif
+    test_draft_params();
     if (argc > 1) {
         test_markov_fixture(argv[1]);
     } else {
