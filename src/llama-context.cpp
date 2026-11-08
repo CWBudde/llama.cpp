@@ -1662,9 +1662,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
 
     // [EXPERIMENTAL] the gates ran synchronously, each layer once, or a layer left the GPU; the last
-    // layer keeps only the output rows, so with no output in this ubatch it has no matmuls
+    // layer keeps only the output rows, so with no output in this ubatch it has no matmuls. A graph
+    // on the CPU remap (a ubatch above the gates, in waves) moved experts the tables do not know of:
+    // they are copied again before a gate reads them. Its matmuls may still run, but they read the
+    // slots, which no load writes any more, and not the tables; the next gated graph waits for them.
     if (model.expert_cache && model.expert_cache->gpu_remap()) {
-        if (status == GGML_STATUS_SUCCESS) {
+        if (!model.expert_cache->gpu_graph(ubatch.n_tokens)) {
+            model.expert_cache->refresh_tables();
+        } else if (status == GGML_STATUS_SUCCESS) {
             model.expert_cache->gate_check_graph(n_outputs > 0);
         } else {
             model.expert_cache->gate_abandon_graph();

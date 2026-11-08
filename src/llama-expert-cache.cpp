@@ -212,11 +212,6 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int 
         // a prefetch writes a slot while the GPU runs; the gate relies on an idle GPU for every write
         throw std::runtime_error("expert cache: --expert-cache-gpu-remap does not work with --expert-prefetch");
     }
-    if (gpu_remap_on && waves) {
-        // not yet: a wave's slot ids come from a CPU op between the wave's matmuls, which the gate
-        // does not run, and the gate's slot ids hold one remap of at most gate_ubatch() tokens
-        throw std::runtime_error("expert cache: --expert-cache-gpu-remap does not work with --expert-cache-waves");
-    }
     if (p.n_slots_layer && p.n_layer_slots > 0) {
         if (p.n_layer_slots != n_layer) {
             throw std::runtime_error(format("expert cache: %d per-layer slot counts for %d layers", p.n_layer_slots, n_layer));
@@ -580,6 +575,15 @@ void llama_expert_cache::gate_remap(int il, const int32_t * ids, int n_ids, int 
     if (stopped) {
         slots->copy_table(il, (int32_t *) gate_table[il]->data);
     }
+}
+
+void llama_expert_cache::refresh_tables() {
+    GGML_ASSERT(gpu_remap_on);
+    std::vector<int32_t *> tables(n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        tables[il] = (int32_t *) gate_table[il]->data;
+    }
+    slots->refresh_tables(tables.data());
 }
 
 void llama_expert_cache::gate_run(int n_tokens, bool stopped) {

@@ -2853,7 +2853,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--expert-cache-gpu-remap"},
         "[EXPERIMENTAL] map the router's ids to slots on the GPU, with no CPU split per layer: needs --expert-cache or "
-        "--expert-cache-layers and every expert layer on Metal, and no --expert-prefetch or --expert-cache-waves; otherwise the model fails to load (default: off)",
+        "--expert-cache-layers and every expert layer on Metal, and no --expert-prefetch; otherwise the model fails to load. With --expert-cache-waves, a ubatch above the slots runs on the CPU remap (default: off)",
         [](common_params & params) {
             params.expert_cache_gpu_remap = true;
         }
@@ -2892,7 +2892,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_EXPERT_CACHE_WAIT"));
     add_opt(common_arg(
         {"--expert-cache-waves"},
-        "[EXPERIMENTAL] instead of capping the ubatch at the expert cache's slots / experts per token, run a larger ubatch's expert matmuls in waves over its experts, loading each wave into the slots (needs 3 * experts per token slots per layer; not with --expert-cache-gpu-remap, otherwise the model fails to load)",
+        "[EXPERIMENTAL] instead of capping the ubatch at the expert cache's slots / experts per token, run a larger ubatch's expert matmuls in waves over its experts, loading each wave into the slots (needs 3 * experts per token slots per layer; with --expert-cache-gpu-remap, such a ubatch runs on the CPU remap and the smaller ones on the GPU remap)",
         [](common_params & params) {
             params.expert_cache_waves = true;
         }

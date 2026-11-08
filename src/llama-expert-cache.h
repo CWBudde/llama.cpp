@@ -97,7 +97,8 @@ struct llama_expert_cache {
     // unbounded with waves
     uint32_t max_ubatch() const;
 
-    // the same without waves, which the GPU remap's slot ids are sized for
+    // the same without waves: the GPU remap's slot ids are sized for it, and a larger ubatch runs
+    // on the CPU remap (see gpu_graph)
     uint32_t gate_ubatch() const;
 
     // whether waves are on: asked for, and every layer has at least 3*n_expert_used slots
@@ -121,6 +122,17 @@ struct llama_expert_cache {
     // their ids from the slot ids, which the Metal backend's gate fills from the layer's table
     bool gpu_remap() const { return gpu_remap_on; }
     void bind_gate(ggml_tensor * mul_mat_id, int il) const;
+
+    // whether the graph of a ubatch of n_tokens runs behind the gates: with the GPU remap, every
+    // ubatch whose experts always fit the slots. A larger one, which only waves allow, takes the CPU
+    // remap and its waves. Without waves every graph is gated, as the context caps its ubatch anyway
+    // (only a reserved graph can be larger). The graph's n_tokens decides, so a reused graph keeps
+    // its path.
+    bool gpu_graph(uint32_t n_tokens) const { return gpu_remap_on && (!waves_on() || n_tokens <= gate_ubatch()); }
+
+    // after a graph on the CPU remap in a GPU remap context: the waves moved experts the tables do
+    // not know of, so every layer's table is copied again, once the loads are done
+    void refresh_tables();
 
     // the Metal backend calls these, with the GPU idle; see ggml_metal_graph_compute_gated
     void gate_remap(int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped);

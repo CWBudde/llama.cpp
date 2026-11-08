@@ -123,6 +123,11 @@ struct llama_expert_slots {
     // holds its bytes, else -1. A loading expert is -1, so a gate that reads the table stops there.
     void copy_table(int l, int32_t * table) const;
 
+    // [EXPERIMENTAL] after a graph on the CPU remap (waves) in a GPU remap context: waits until no
+    // load is queued or running, then copies every layer's table (tables[l], n_expert entries), so
+    // that no entry names a slot whose expert has changed since a gate last copied it
+    void refresh_tables(int32_t * const * tables);
+
     // waits until no load is queued or running
     void drain();
 
@@ -165,6 +170,9 @@ private:
     // one wait for a load to end: the caller holds the lock and checks its predicate again after
     // it; the lock is held again on return
     void wait_load(std::unique_lock<std::mutex> & lock, wait_budget & budget);
+
+    // copy_table with the lock held
+    void fill_table(int l, int32_t * table) const;
 
     int pick_victim(int l, int w_now = -1) const;
     void drop_prefetches(int l);

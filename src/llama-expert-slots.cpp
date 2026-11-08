@@ -55,12 +55,25 @@ int llama_expert_slots::slot_of(int l, int e) const {
     return layers[l].where[e];
 }
 
-void llama_expert_slots::copy_table(int l, int32_t * table) const {
-    std::lock_guard<std::mutex> lock(mtx);
+void llama_expert_slots::fill_table(int l, int32_t * table) const {
     const auto & L = layers[l];
     for (int e = 0; e < n_expert; ++e) {
         const int s = L.where[e];
         table[e] = s >= 0 && L.slots[s].state == READY ? s : -1;
+    }
+}
+
+void llama_expert_slots::copy_table(int l, int32_t * table) const {
+    std::lock_guard<std::mutex> lock(mtx);
+    fill_table(l, table);
+}
+
+// off the critical path of a gate, like drain(): it sleeps in every mode
+void llama_expert_slots::refresh_tables(int32_t * const * tables) {
+    std::unique_lock<std::mutex> lock(mtx);
+    cv_done.wait(lock, [this] { return q_demand.empty() && q_prefetch.empty() && running == 0; });
+    for (int l = 0; l < (int) layers.size(); ++l) {
+        fill_table(l, tables[l]);
     }
 }
 

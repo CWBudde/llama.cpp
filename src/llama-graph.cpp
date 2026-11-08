@@ -2364,13 +2364,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * ids_mm   = selected_experts;
     ggml_tensor * ids_cont = nullptr; // with waves: the router's ids, contiguous
     int n_waves = 1;
+    // with the GPU remap, a graph whose ubatch fits the gates runs behind them; a larger ubatch (waves)
+    // takes the CPU remap. The graph's ubatch decides, not this layer's rows (the last layer may keep
+    // only the outputs), so that a graph is gated in every layer or in none.
+    const bool gated = expert_cache && il >= 0 && expert_cache->gpu_graph((uint32_t) this->n_tokens);
     if (expert_cache && il >= 0) {
         GGML_ASSERT(!slots);
         GGML_ASSERT(!gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s);
         n_waves = expert_cache->n_waves(il, (int) n_tokens);
-        if (expert_cache->gpu_remap()) {
+        if (gated) {
             // the GPU remap keeps the graph the resident run has: the router's ids stay the inputs, and
-            // the Metal backend's gate gives the matmuls the slot ids (the cache refuses waves with it)
+            // the Metal backend's gate gives the matmuls the slot ids. The ubatch fits the slots, so
+            // it takes one wave.
             GGML_ASSERT(n_waves == 1);
         } else if (n_waves == 1) {
             ids_mm = expert_cache->build_remap(ctx0, selected_experts, il);
@@ -2428,7 +2433,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         } else {
             // separate gate and up path
             up = build_lora_mm_id(up_exps, cur, ids_mm, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
-            if (expert_cache && il >= 0 && expert_cache->gpu_remap()) {
+            if (gated) {
                 expert_cache->bind_gate(up, il);
             }
             cb(up, "ffn_moe_up", il);
@@ -2444,7 +2449,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
             if (gate_exps) {
                 cur = build_lora_mm_id(gate_exps, cur, ids_mm, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
-                if (expert_cache && il >= 0 && expert_cache->gpu_remap()) {
+                if (gated) {
                     expert_cache->bind_gate(cur, il);
                 }
                 cb(cur, "ffn_moe_gate", il);
@@ -2559,7 +2564,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             experts = build_lora_mm_id(down_exps, cur, ids_mm, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
-            if (expert_cache && il >= 0 && expert_cache->gpu_remap()) {
+            if (gated) {
                 expert_cache->bind_gate(experts, il);
             }
             //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)

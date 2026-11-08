@@ -1391,6 +1391,53 @@ static void test_waves_wait_modes() {
     }
 }
 
+// after a graph on the CPU remap (waves) the GPU remap's tables are refreshed: with every load
+// done, each layer's entry for an expert is the slot that holds it, else -1. A table copied before
+// the waves names slots whose experts the waves replaced: hence the refresh.
+static void test_waves_refresh_tables() {
+    const int n_expert = 48, k = 6;
+    fake f(2, 18);
+    f.delay_us = 200;
+    auto c = make(f, n_expert, 4);
+    std::vector<std::vector<int32_t>> tables(2, std::vector<int32_t>(n_expert, -2));
+    std::vector<int32_t *> ptrs = {tables[0].data(), tables[1].data()};
+    // decode ubatches behind the gates first: a stopped gate copies its layer's table
+    std::vector<int32_t> out;
+    for (int l = 0; l < 2; ++l) {
+        CHECK(remap(*c, l, {40, 41, 42, 43, 44, 45}, out));
+        c->copy_table(l, ptrs[l]);
+        CHECK(ptrs[l][40] >= 0 && f.at(l, ptrs[l][40]) == 40);
+    }
+    // a prefill ubatch in waves over both layers evicts them
+    const auto ids = wave_ids(64, k, 5, 40);
+    for (int l = 0; l < 2; ++l) {
+        CHECK(run_waves(f, *c, l, ids, k, llama_expert_wave_cap(18, k), 0) == 7);
+    }
+    int stale = 0;
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_expert; ++e) {
+            const int s = tables[l][e];
+            stale += s >= 0 && f.at(l, s) != e;
+        }
+    }
+    CHECK(stale > 0);
+    // loads still running at the refresh: it waits for them, so they are in the table
+    const int pf[] = {44, 45, 46, 47};
+    c->prefetch(0, pf, 4, false);
+    c->refresh_tables(ptrs.data());
+    int resident = 0;
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_expert; ++e) {
+            const int s = tables[l][e];
+            CHECK(s == c->slot_of(l, e));
+            CHECK(s == -1 || (s >= 0 && s < f.n_slots && f.at(l, s) == e));
+            resident += s >= 0;
+        }
+    }
+    CHECK(resident == 2*f.n_slots);
+    CHECK(tables[0][47] >= 0 && f.at(0, tables[0][47]) == 47);
+}
+
 static void test_waves_failure() {
     fake f(1, 18);
     auto c = make(f, 48, 2);
@@ -1462,34 +1509,44 @@ static std::string cache_refusal(const llama_expert_cache_params & p) {
     return "";
 }
 
-// the GPU remap refuses waves for now, as it refuses prefetch: the error names both options
-static void test_waves_gpu_remap_refused() {
+// the GPU remap runs with waves (prefill on the CPU remap, decode behind the gates), not with
+// prefetch: the error names both options
+static void test_gpu_remap_combinations() {
     auto p = llama_expert_cache_default_params();
     p.n_slots   = 8;
     p.waves     = true;
     p.gpu_remap = true;
-    const std::string err = cache_refusal(p);
-    CHECK(err.find("--expert-cache-gpu-remap") != std::string::npos && err.find("--expert-cache-waves") != std::string::npos);
+    CHECK(cache_refusal(p).empty());
     p.prefetch_k = 4;
-    p.waves      = false;
+    const std::string err = cache_refusal(p);
+    CHECK(err.find("--expert-cache-gpu-remap") != std::string::npos && err.find("--expert-prefetch") != std::string::npos);
+    p.waves = false;
     CHECK(cache_refusal(p).find("--expert-prefetch") != std::string::npos);
     p.prefetch_k = 0;
     CHECK(cache_refusal(p).empty());
-    p.gpu_remap = false;
-    p.waves     = true;
-    CHECK(cache_refusal(p).empty());
 }
 
-// with waves the ubatch is unbounded, while the GPU remap's slot ids keep the capped size
+// with waves the ubatch is unbounded, while the GPU remap's slot ids keep the capped size; a graph
+// runs behind the gates exactly when its ubatch fits them
 static void test_gate_ubatch() {
     auto p = llama_expert_cache_default_params();
     p.n_slots = 8;
     p.waves   = true;
     const llama_expert_cache a(p, 2, 16, 2);
     CHECK(a.waves_on() && a.max_ubatch() == UINT32_MAX && a.gate_ubatch() == 4);
-    p.waves = false;
+    CHECK(!a.gpu_graph(1) && !a.gpu_graph(4) && !a.gpu_graph(512)); // no GPU remap: no gates
+    p.gpu_remap = true;
     const llama_expert_cache b(p, 2, 16, 2);
-    CHECK(!b.waves_on() && b.max_ubatch() == 4 && b.gate_ubatch() == 4);
+    CHECK(b.waves_on() && b.max_ubatch() == UINT32_MAX && b.gate_ubatch() == 4);
+    CHECK(b.gpu_graph(1) && b.gpu_graph(4) && !b.gpu_graph(5) && !b.gpu_graph(512));
+    // without waves every ubatch of the context fits the gates, as before
+    p.waves = false;
+    const llama_expert_cache c(p, 2, 16, 2);
+    CHECK(!c.waves_on() && c.max_ubatch() == 4 && c.gate_ubatch() == 4);
+    for (uint32_t n = 1; n <= c.max_ubatch(); ++n) {
+        CHECK(c.gpu_graph(n));
+    }
+    CHECK(c.gpu_graph(512)); // a reserved graph above the cap stays gated, as before
 }
 
 // a draft model gets the target's params except its expert cache: Kolibri only, one context per model
@@ -1541,7 +1598,8 @@ int main(int argc, char ** argv) {
     test_waves_prefetched();
     test_waves_failure();
     test_waves_wait_modes();
-    test_waves_gpu_remap_refused();
+    test_waves_refresh_tables();
+    test_gpu_remap_combinations();
     test_gate_ubatch();
     test_top_k();
     test_sha256();
