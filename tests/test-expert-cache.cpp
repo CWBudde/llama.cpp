@@ -1008,11 +1008,17 @@ static void test_draft_params() {
     target.expert_cache        = 128;
     target.expert_cache_layers = { 128, 64 };
     target.expert_cache_stats  = "stats.json";
+    target.expert_cache_sidefile = "experts.side";
+    target.expert_cache_gpu_remap = true;
     const common_params draft = common_base_params_to_speculative(target);
     CHECK(draft.expert_cache == 0);
     CHECK(draft.expert_cache_layers.empty());
     CHECK(draft.expert_cache_stats.empty());
+    CHECK(draft.expert_cache_sidefile.empty());
+    // the remap without slots is refused at load, so the draft would not load
+    CHECK(!draft.expert_cache_gpu_remap);
     CHECK(target.expert_cache == 128);
+    CHECK(target.expert_cache_gpu_remap);
 }
 
 int main(int argc, char ** argv) {
