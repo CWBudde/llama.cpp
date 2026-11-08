@@ -1727,6 +1727,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         ec.gpu_remap          = params.expert_cache_gpu_remap;
         ec.wait_mode          = params.expert_cache_wait;
         ec.wait_spin_us       = params.expert_cache_wait_us;
+        ec.waves              = params.expert_cache_waves;
         mparams.expert_cache  = &ec;
     }
 

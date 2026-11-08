@@ -2652,6 +2652,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    // [EXPERIMENTAL] the expert cache's waves repeat the expert matmuls of a layer
+    if (model.expert_cache) {
+        res += model.expert_cache->wave_nodes((int) n_tokens);
+    }
+
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
