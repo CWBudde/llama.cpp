@@ -21,6 +21,9 @@ struct llama_expert_cache_counts {
     uint64_t hits           = 0; // needed and ready
     uint64_t hits_loading   = 0; // needed while a prefetch of it was queued or running: awaited, not repeated
     uint64_t misses         = 0; // needed and not in the cache: loaded on demand
+    uint64_t skipped        = 0; // [EXPERIMENTAL] distinct experts of a remap left out by --expert-cache-skip: neither
+                                 // needed nor a miss, so hits + hits_loading + misses + skipped = distinct ids
+    uint64_t skipped_ids    = 0; // the ids those were: one per token that selected a skipped expert
     uint64_t evictions      = 0; // a ready expert replaced
     uint64_t demand_bytes   = 0; // read for misses
     uint64_t prefetch_bytes = 0; // read for prefetches
@@ -52,13 +55,22 @@ struct llama_expert_wait {
     int    spin_us = 0; // HYBRID only
 };
 
+// [EXPERIMENTAL] the lossy skip (--expert-cache-skip): an id at weight rank 4 or below (of its token's
+// ids) whose weight is below `weight` and whose expert is a true miss is not loaded, unless another id
+// of the ubatch needs that expert; it gets the slot of its token's rank-map_rank expert, and its
+// weight is masked to 0. weight 0 is off.
+struct llama_expert_skip {
+    float weight   = 0;
+    int   map_rank = 1; // 1 or 2; 2 is a test hook: with the weight masked the slot does not matter
+};
+
 struct llama_expert_slots {
     // load(layer, expert, slot, preads) reads one expert into one slot, adds its read calls to
     // preads and returns false on failure
     using load_fn = std::function<bool(int layer, int expert, int slot, uint64_t & preads)>;
 
     llama_expert_slots(std::vector<int> n_slots, int n_expert, std::vector<size_t> expert_bytes, int n_threads, load_fn load,
-                       llama_expert_wait wait = {});
+                       llama_expert_wait wait = {}, llama_expert_skip skip = {});
     ~llama_expert_slots();
 
     llama_expert_slots(const llama_expert_slots &) = delete;
@@ -69,14 +81,17 @@ struct llama_expert_slots {
     // flight from then until the next remap: no prefetch replaces its slots. It returns false, with
     // nothing changed, when the ubatch needs more distinct experts than the layer has slots or an
     // id is out of range, and false after a demand load failed.
-    bool remap(int l, const int32_t * ids, int n, bool decode, int32_t * out);
+    // With the skip on and weights given (n ids, n_used per token, the router weights of the ids), the
+    // rule of llama_expert_skip applies, and skipped (n entries, if given) gets 1 for a skipped id, else 0.
+    bool remap(int l, const int32_t * ids, int n, bool decode, int32_t * out,
+               const float * weights = nullptr, int n_used = 0, uint8_t * skipped = nullptr);
 
     // prefetch queues loads of the experts of layer l that are neither ready nor loading, best
     // first, into its least recently used slots. Nothing is queued for the layer in flight.
     void prefetch(int l, const int * experts, int n, bool decode);
 
-    // distinct experts of the last remap, in the order the ids met them
-    const std::vector<int> & last_needed() const { return needed; }
+    // distinct experts of the last remap, in the order the ids met them, skipped ones included
+    const std::vector<int> & last_needed() const { return n_skipped_last > 0 ? selected : needed; }
 
     int n_slots(int l) const { return (int) layers[l].slots.size(); }
     int min_slots() const;
@@ -137,12 +152,25 @@ private:
     const std::vector<size_t> expert_bytes; // per layer
     load_fn load;
     const llama_expert_wait wait;
+    const llama_expert_skip skip;
 
     std::vector<layer> layers;
     int      in_flight = -1;
     uint64_t tick      = 0;
     std::vector<int>  needed;
     std::vector<char> keep; // per expert: needed by the remap running now
+
+    // the skip's scratch, per id of the running remap
+    std::vector<int>  rank;      // 1 for the largest weight of its token
+    std::vector<char> skip_id;
+    std::vector<char> unskip;    // per expert: some id of the ubatch needs it
+    std::vector<char> seen;      // per expert: met by the remap's ids
+    std::vector<int>  selected;  // every distinct expert of the last remap, when it skipped some
+    int n_skipped_last = 0;      // distinct experts the last remap skipped
+    int n_skipped_ids  = 0;      // and its ids that selected them
+
+    // the skip's rule for one remap: fills rank, skip_id, selected and the two counts
+    void mark_skips(int l, const int32_t * ids, int n, const float * weights, int n_used);
 
     llama_expert_cache_counts c_prefill;
     llama_expert_cache_counts c_decode;

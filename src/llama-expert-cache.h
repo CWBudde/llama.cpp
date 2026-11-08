@@ -8,6 +8,9 @@
 // a slot with pread (F_NOCACHE on macOS unless buffered, so the bytes do not stay in the page cache); the matmuls
 // then read the slots. The router chooses every expert: the expert weights keep its own ids, and a
 // prediction only ever decides what to read ahead.
+//
+// The one exception is the lossy skip (--expert-cache-skip, see llama_expert_skip): the remap op then
+// also reads the router weights, leaves some misses unread, and a second CPU op masks their weights to 0.
 
 #include "llama.h"
 #include "llama-expert-sidefile.h"
@@ -87,8 +90,13 @@ struct llama_expert_cache {
     void detach();
     bool in_use() const { return attached; }
 
-    // the slot ids of the router's selected experts [n_expert_used, n_tokens], from a CPU op
-    ggml_tensor * build_remap(ggml_context * ctx, ggml_tensor * selected_experts, int il);
+    // the slot ids of the router's selected experts [n_expert_used, n_tokens], from a CPU op; with the
+    // skip on, weights are the router weights [1, n_expert_used, n_tokens] the rule reads
+    ggml_tensor * build_remap(ggml_context * ctx, ggml_tensor * selected_experts, int il, ggml_tensor * weights = nullptr);
+
+    // [EXPERIMENTAL] the skip: 0 for the ids the remap slots skipped, else 1 [1, n_expert_used, n_tokens]
+    bool skip_on() const { return skip.weight > 0; }
+    ggml_tensor * build_skip_mask(ggml_context * ctx, ggml_tensor * slots, int il);
 
     // [EXPERIMENTAL] the GPU remap (--expert-cache-gpu-remap): no CPU op; the layer's matmuls read
     // their ids from the slot ids, which the Metal backend's gate fills from the layer's table
@@ -111,8 +119,9 @@ struct llama_expert_cache {
     ggml_tensor * down(int il) const { return slot_t[il].t[2]; }
 
     // the remap op's work
-    void remap(int il, const ggml_tensor * ids, ggml_tensor * dst);
-    void remap_ids(int il, const int32_t * ids, int n_ids, int n_tokens, int32_t * out);
+    void remap(int il, const ggml_tensor * ids, const ggml_tensor * weights, ggml_tensor * dst);
+    void remap_ids(int il, const int32_t * ids, int n_ids, int n_tokens, int32_t * out, const float * weights = nullptr);
+    void skip_mask(int il, ggml_tensor * dst) const;
 
     // the decode timing to add to the stats; the model owns it
     void set_decode_diag(const llama_decode_diag * d) { diag = d; }
@@ -136,6 +145,8 @@ private:
     std::string sidefile_path;
     bool gpu_remap_on;
     llama_expert_wait wait; // how a remap waits for its loads
+    llama_expert_skip skip; // off with weight 0
+    std::vector<std::vector<uint8_t>> skipped; // per layer: the skip flags of its last remap, per id
 
     std::vector<tensors>  stacked;
     std::vector<tensors>  slot_t; // the slot tensors; offs unused

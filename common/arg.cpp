@@ -2853,7 +2853,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--expert-cache-gpu-remap"},
         "[EXPERIMENTAL] map the router's ids to slots on the GPU, with no CPU split per layer: needs --expert-cache or "
-        "--expert-cache-layers and every expert layer on Metal, and no --expert-prefetch; otherwise the model fails to load (default: off)",
+        "--expert-cache-layers and every expert layer on Metal, and no --expert-prefetch or --expert-cache-skip; otherwise the model fails to load (default: off)",
         [](common_params & params) {
             params.expert_cache_gpu_remap = true;
         }
@@ -2890,6 +2890,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_WAIT"));
+    add_opt(common_arg(
+        {"--expert-cache-skip"}, "W",
+        "[EXPERIMENTAL, lossy] do not read an expert the router chose at weight rank 4 or below of a token, with a weight below W, "
+        "when it is not in the cache and no other token of the ubatch needs it: its weight is masked to 0. Needs --expert-cache or "
+        "--expert-cache-layers and the CPU remap (not --expert-cache-gpu-remap) (default: 0, off)",
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            float w = NAN;
+            try {
+                w = std::stof(value, &pos);
+            } catch (const std::exception &) {
+                pos = 0;
+            }
+            if (value.empty() || pos != value.size() || !std::isfinite(w) || w < 0.0f) {
+                throw std::invalid_argument("--expert-cache-skip " + value + ": want a finite weight >= 0");
+            }
+            params.expert_cache_skip = w;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_SKIP"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",

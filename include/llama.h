@@ -346,6 +346,10 @@ extern "C" {
                                        // no prefetch; else the model fails to load)
         enum llama_expert_cache_wait wait_mode; // how a remap waits for its loads
         int32_t         wait_spin_us;  // LLAMA_EXPERT_CACHE_WAIT_HYBRID: the spin per remap in microseconds, > 0
+        float           skip_weight;   // lossy: a true miss at weight rank 4 or below of its token, with a router weight
+                                       // below this, is not read and its weight is masked to 0; 0 = off
+                                       // (a cache with the CPU remap, so not with gpu_remap; else the model fails to load)
+        int32_t         skip_map_rank; // the token's expert whose slot a skipped id reads, 1 or 2 (a test hook; default 1)
     };
 
     struct llama_model_params {

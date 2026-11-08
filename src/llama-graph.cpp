@@ -2367,8 +2367,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // the GPU remap keeps the graph the resident run has: the router's ids stay the inputs, and
         // the Metal backend's gate gives the matmuls the slot ids
         if (!expert_cache->gpu_remap()) {
-            ids_mm = expert_cache->build_remap(ctx0, selected_experts, il);
+            // [EXPERIMENTAL] the lossy skip: the remap reads the weights, and the ids it left unread get weight 0
+            const bool skip = expert_cache->skip_on();
+            ids_mm = expert_cache->build_remap(ctx0, selected_experts, il, skip ? weights : nullptr);
             cb(ids_mm, "ffn_moe_slots", il);
+            if (skip) {
+                ggml_tensor * mask = expert_cache->build_skip_mask(ctx0, ids_mm, il); // [1, n_expert_used, n_tokens]
+                cb(mask, "ffn_moe_skip_mask", il);
+                weights = ggml_mul(ctx0, weights, mask);
+                cb(weights, "ffn_moe_weights_skipped", il);
+                // the mask right behind the remap, so that both run in one CPU split
+                ggml_build_forward_expand(gf, weights);
+            }
         }
         up_exps   = expert_cache->up(il);
         gate_exps = gate_exps ? expert_cache->gate(il) : nullptr;

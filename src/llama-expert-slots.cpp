@@ -14,8 +14,9 @@
 #endif
 
 llama_expert_slots::llama_expert_slots(std::vector<int> n_slots, int n_expert, std::vector<size_t> expert_bytes, int n_threads, load_fn load,
-                                       llama_expert_wait wait)
-    : n_expert(n_expert), expert_bytes(std::move(expert_bytes)), load(std::move(load)), wait(wait), keep(n_expert, 0) {
+                                       llama_expert_wait wait, llama_expert_skip skip)
+    : n_expert(n_expert), expert_bytes(std::move(expert_bytes)), load(std::move(load)), wait(wait), skip(skip), keep(n_expert, 0),
+      unskip(n_expert, 0), seen(n_expert, 0) {
     assert(n_slots.size() == this->expert_bytes.size());
     layers.resize(n_slots.size());
     for (size_t l = 0; l < n_slots.size(); ++l) {
@@ -177,7 +178,55 @@ void llama_expert_slots::assign(int l, int s, int e, bool demand, bool decode) {
     (demand ? q_demand : q_prefetch).push_back({l, s});
 }
 
-bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, int32_t * out) {
+// ranks 1 to 3 of a token's ids are never skipped
+static constexpr int skip_min_rank = 4;
+
+// the caller holds the lock
+void llama_expert_slots::mark_skips(int l, const int32_t * ids, int n, const float * w, int k) {
+    const auto & L = layers[l];
+    rank.assign(n, 0);
+    skip_id.assign(n, 0);
+    // rank by weight within each token, the earlier position first of equal weights
+    for (int t = 0; t < n; t += k) {
+        for (int i = t; i < t + k; ++i) {
+            int r = 1;
+            for (int j = t; j < t + k; ++j) {
+                r += w[j] > w[i] || (w[j] == w[i] && j < i);
+            }
+            rank[i] = r;
+        }
+    }
+    // a candidate is a true miss: neither ready nor loading
+    for (int i = 0; i < n; ++i) {
+        skip_id[i] = rank[i] >= skip_min_rank && w[i] < skip.weight && L.where[ids[i]] < 0;
+        if (!skip_id[i]) {
+            unskip[ids[i]] = 1;
+        }
+    }
+    // an expert that some id needs is loaded for all of them
+    n_skipped_last = 0;
+    n_skipped_ids  = 0;
+    selected.clear();
+    for (int i = 0; i < n; ++i) {
+        const int e = ids[i];
+        if (skip_id[i] && unskip[e]) {
+            skip_id[i] = 0;
+        }
+        n_skipped_ids += skip_id[i];
+        if (!seen[e]) {
+            seen[e] = 1;
+            selected.push_back(e);
+            n_skipped_last += skip_id[i];
+        }
+    }
+    for (int i = 0; i < n; ++i) {
+        unskip[ids[i]] = 0;
+        seen[ids[i]]   = 0;
+    }
+}
+
+bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, int32_t * out,
+                               const float * weights, int n_used, uint8_t * skipped) {
     std::unique_lock<std::mutex> lock(mtx);
     auto & L = layers[l];
     wait_budget budget; // one spin budget for all of this remap's waits
@@ -187,10 +236,16 @@ bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, i
             return false;
         }
     }
+    const bool skipping = skip.weight > 0 && weights && n_used > 0 && n % n_used == 0;
+    n_skipped_last = 0;
+    n_skipped_ids  = 0;
+    if (skipping) {
+        mark_skips(l, ids, n, weights, n_used);
+    }
     needed.clear();
     for (int i = 0; i < n; ++i) {
         const int e = ids[i];
-        if (!keep[e]) {
+        if (!keep[e] && !(skipping && skip_id[i])) {
             keep[e] = 1;
             needed.push_back(e);
         }
@@ -210,6 +265,8 @@ bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, i
     auto & c = counts_of(decode);
     c.steps++;
     c.needed += needed.size();
+    c.skipped     += n_skipped_last;
+    c.skipped_ids += n_skipped_ids;
 
     // queued prefetches of this layer that it does not need are dropped: their slots are free again
     for (auto it = q_prefetch.begin(); it != q_prefetch.end();) {
@@ -309,6 +366,26 @@ bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, i
     if (ok) {
         for (int i = 0; i < n; ++i) {
             out[i] = L.where[ids[i]];
+        }
+        // a skipped id reads the slot of its token's rank-map_rank expert, which is needed, hence ready
+        for (int t = 0; n_skipped_ids > 0 && t < n; t += n_used) {
+            int target = -1;
+            for (int i = t; i < t + n_used && target < 0; ++i) {
+                target = rank[i] == skip.map_rank && !skip_id[i] ? i : -1;
+            }
+            for (int i = t; i < t + n_used && target < 0; ++i) {
+                target = !skip_id[i] ? i : -1; // only NaN weights tie ranks: the first id kept
+            }
+            for (int i = t; i < t + n_used; ++i) {
+                if (skip_id[i]) {
+                    out[i] = L.where[ids[target]];
+                }
+            }
+        }
+        if (skipped) {
+            for (int i = 0; i < n; ++i) {
+                skipped[i] = skipping && skip_id[i] ? 1 : 0;
+            }
         }
     }
     release();

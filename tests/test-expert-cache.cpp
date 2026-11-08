@@ -13,6 +13,7 @@
 // takes them. Every expert (or EXPERTS_PER_LAYER spread over each layer) reads the same bytes on
 // both paths, at 3 and at 1 pread.
 
+#include "../src/llama-expert-cache.h"
 #include "../src/llama-expert-sidefile.h"
 #include "../src/llama-expert-slots.h"
 #include "arg.h"
@@ -115,9 +116,10 @@ struct fake {
     }
 };
 
-static std::unique_ptr<llama_expert_slots> make(fake & f, int n_expert, int n_threads, size_t bytes = 100, llama_expert_wait wait = {}) {
+static std::unique_ptr<llama_expert_slots> make(fake & f, int n_expert, int n_threads, size_t bytes = 100, llama_expert_wait wait = {},
+                                                llama_expert_skip skip = {}) {
     return std::make_unique<llama_expert_slots>(std::vector<int>(f.n_layer, f.n_slots), n_expert,
-        std::vector<size_t>(f.n_layer, bytes), n_threads, [&f](int l, int e, int s, uint64_t & preads) { preads++; return f.load(l, e, s); }, wait);
+        std::vector<size_t>(f.n_layer, bytes), n_threads, [&f](int l, int e, int s, uint64_t & preads) { preads++; return f.load(l, e, s); }, wait, skip);
 }
 
 // every id maps to a slot that holds it
@@ -133,6 +135,14 @@ static bool mapped(const fake & f, int l, const std::vector<int32_t> & ids, cons
 static bool remap(llama_expert_slots & c, int l, std::vector<int32_t> ids, std::vector<int32_t> & out, bool decode = true) {
     out.assign(ids.size(), -1);
     return c.remap(l, ids.data(), (int) ids.size(), decode, out.data());
+}
+
+// remap with the router weights of the ids, n_used ids per token; skipped gets the skip flags
+static bool remap_w(llama_expert_slots & c, int l, std::vector<int32_t> ids, std::vector<float> w, int n_used,
+                    std::vector<int32_t> & out, std::vector<uint8_t> & skipped, bool decode = true) {
+    out.assign(ids.size(), -1);
+    skipped.assign(ids.size(), 0xff);
+    return c.remap(l, ids.data(), (int) ids.size(), decode, out.data(), w.data(), n_used, skipped.data());
 }
 
 // opens the fake's gate after a pause, so that a remap waits for a gated load
@@ -521,6 +531,214 @@ static void test_wait_arg() {
     const llama_expert_cache_params ec = llama_expert_cache_default_params();
     CHECK(ec.wait_mode == LLAMA_EXPERT_CACHE_WAIT_SLEEP && ec.wait_spin_us == 0);
     CHECK(llama_expert_wait{}.mode == llama_expert_wait::SLEEP);
+}
+
+// the counters a skip may not change when it is off
+static bool same_counts(const llama_expert_cache_counts & a, const llama_expert_cache_counts & b) {
+    return a.steps == b.steps && a.needed == b.needed && a.hits == b.hits && a.hits_loading == b.hits_loading &&
+           a.misses == b.misses && a.evictions == b.evictions && a.loads == b.loads && a.demand_bytes == b.demand_bytes &&
+           a.skipped == b.skipped && a.skipped_ids == b.skipped_ids;
+}
+
+static bool none_skipped(const std::vector<uint8_t> & sk) {
+    return std::all_of(sk.begin(), sk.end(), [](uint8_t x) { return x == 0; });
+}
+
+static void test_skip_off() {
+    // (a) a threshold of 0, or no weights, maps and counts as the cache without the rule
+    const std::vector<std::vector<int32_t>> steps = {
+        {0, 1, 2, 3, 4, 5}, {0, 1, 2, 6, 7, 8}, {9, 1, 2, 3, 10, 11}, {12, 13, 14, 15, 10, 11},
+    };
+    const std::vector<float> w = {0.9f, 0.8f, 0.7f, 0.05f, 0.04f, 0.03f};
+    fake f0(1, 8), f1(1, 8), f2(1, 8);
+    auto c0 = make(f0, 16, 1);
+    auto c1 = make(f1, 16, 1, 100, {}, {0.0f, 1}); // threshold 0, weights given
+    auto c2 = make(f2, 16, 1, 100, {}, {0.1f, 1}); // a threshold, no weights
+    for (const auto & ids : steps) {
+        std::vector<int32_t> o0, o1, o2;
+        std::vector<uint8_t> sk;
+        CHECK(remap(*c0, 0, ids, o0) && mapped(f0, 0, ids, o0));
+        CHECK(remap_w(*c1, 0, ids, w, 6, o1, sk) && o1 == o0 && none_skipped(sk));
+        CHECK(remap(*c2, 0, ids, o2) && o2 == o0);
+        CHECK(c1->last_needed() == c0->last_needed());
+    }
+    CHECK(same_counts(c0->counts(true), c1->counts(true)) && same_counts(c0->counts(true), c2->counts(true)));
+    CHECK(c0->counts(true).skipped == 0 && f0.n_loads == f1.n_loads && f0.n_loads == f2.n_loads);
+}
+
+static void test_skip_rule() {
+    fake f(1, 8);
+    auto c = make(f, 16, 1, 100, {}, {0.1f, 1});
+    std::vector<int32_t> out;
+    std::vector<uint8_t> sk;
+    CHECK(remap_w(*c, 0, {0, 1, 2, 3, 4, 5}, {0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f}, 6, out, sk) && mapped(f, 0, {0, 1, 2, 3, 4, 5}, out));
+    CHECK(f.n_loads == 6 && none_skipped(sk));
+
+    // (b, f) expert 9, a true miss, is 2nd in id order but 5th by weight and below the threshold: no
+    // load, the slot of the rank-1 expert (0). Expert 4, 6th and below it too, is resident: mapped.
+    CHECK(remap_w(*c, 0, {0, 9, 1, 2, 3, 4}, {0.9f, 0.05f, 0.8f, 0.7f, 0.6f, 0.01f}, 6, out, sk));
+    CHECK(f.n_loads == 6 && c->slot_of(0, 9) < 0);
+    CHECK(out[1] == out[0] && f.at(0, out[1]) == 0);
+    CHECK(sk == std::vector<uint8_t>({0, 1, 0, 0, 0, 0}));
+    CHECK(mapped(f, 0, {0, 1, 2, 3, 4}, {out[0], out[2], out[3], out[4], out[5]}));
+    // the predictor still sees the router's whole selection
+    CHECK(c->last_needed() == std::vector<int>({0, 9, 1, 2, 3, 4}));
+    auto n = c->counts(true);
+    CHECK(n.skipped == 1 && n.skipped_ids == 1 && n.misses == 6 && n.hits == 5 && n.needed == 11);
+
+    // (f) the other way round: expert 10 is 5th in id order but first by weight, every weight below
+    // the threshold: loaded. Experts 2, 3 and 4 (ranks 4 to 6) are resident.
+    CHECK(remap_w(*c, 0, {0, 1, 2, 3, 10, 4}, {0.09f, 0.08f, 0.07f, 0.06f, 0.095f, 0.01f}, 6, out, sk) && mapped(f, 0, {0, 1, 2, 3, 10, 4}, out));
+    CHECK(f.n_loads == 7 && none_skipped(sk));
+
+    // (c) misses at ranks 1 to 3 are loaded, however low their weights
+    CHECK(remap_w(*c, 0, {11, 12, 13, 0, 1, 2}, {0.09f, 0.08f, 0.07f, 0.06f, 0.05f, 0.04f}, 6, out, sk) && mapped(f, 0, {11, 12, 13, 0, 1, 2}, out));
+    CHECK(f.n_loads == 10 && none_skipped(sk));
+
+    // (d) a miss at rank 5 with a weight at the threshold is loaded; 12 at rank 6 is resident
+    CHECK(remap_w(*c, 0, {0, 1, 2, 11, 14, 12}, {0.9f, 0.8f, 0.7f, 0.6f, 0.1f, 0.05f}, 6, out, sk) && mapped(f, 0, {0, 1, 2, 11, 14, 12}, out));
+    CHECK(f.n_loads == 11 && none_skipped(sk));
+
+    // the counters add up: every distinct expert of a step is a hit, a miss or skipped
+    n = c->counts(true);
+    CHECK(n.hits + n.hits_loading + n.misses == n.needed && n.needed + n.skipped == 5*6);
+    CHECK(n.skipped == 1 && n.loads == 11);
+}
+
+static void test_skip_loading() {
+    // (e) an expert whose prefetch is still loading is awaited at rank 5 below the threshold, not skipped
+    fake f(2, 8);
+    f.gated.insert({1, 14});
+    auto c = make(f, 16, 2, 100, {}, {0.1f, 1});
+    std::vector<int32_t> out;
+    std::vector<uint8_t> sk;
+    CHECK(remap_w(*c, 1, {0, 1, 2, 3, 4, 5}, {0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f}, 6, out, sk));
+    CHECK(remap(*c, 0, {0}, out)); // layer 1 is not in flight now
+    const int p = 14;
+    c->prefetch(1, &p, 1, true);
+    {
+        opener o(f);
+        CHECK(remap_w(*c, 1, {0, 1, 2, 3, 14, 4}, {0.9f, 0.8f, 0.7f, 0.6f, 0.05f, 0.01f}, 6, out, sk) && mapped(f, 1, {0, 1, 2, 3, 14, 4}, out));
+    }
+    CHECK(none_skipped(sk));
+    const auto n = c->counts(true);
+    CHECK(n.hits_loading == 1 && n.prefetch_used == 1 && n.skipped == 0 && n.skipped_ids == 0);
+}
+
+static void test_skip_ubatch() {
+    // (g) a prefill ubatch of two tokens
+    fake f(1, 8);
+    auto c = make(f, 16, 1, 100, {}, {0.1f, 1});
+    std::vector<int32_t> out;
+    std::vector<uint8_t> sk;
+    CHECK(remap_w(*c, 0, {0, 1, 2, 3, 4, 5}, {0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f}, 6, out, sk));
+    // expert 15 is 5th and below the threshold for token 0, but first for token 1: loaded for both
+    const std::vector<int32_t> a = {0, 1, 2, 3, 15, 4,  15, 0, 1, 2, 3, 4};
+    CHECK(remap_w(*c, 0, a, {0.9f, 0.8f, 0.7f, 0.6f, 0.05f, 0.01f,  0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f}, 6, out, sk, false));
+    CHECK(mapped(f, 0, a, out) && none_skipped(sk) && f.n_loads == 7);
+    CHECK(c->counts(false).skipped == 0);
+    // expert 9 is 5th and below the threshold for both: skipped for both, each mapped to its own rank-1 expert
+    CHECK(remap_w(*c, 0, {0, 1, 2, 3, 9, 4,  1, 0, 2, 3, 9, 4},
+                  {0.9f, 0.8f, 0.7f, 0.6f, 0.05f, 0.01f,  0.9f, 0.8f, 0.7f, 0.6f, 0.05f, 0.01f}, 6, out, sk, false));
+    CHECK(f.n_loads == 7 && c->slot_of(0, 9) < 0);
+    CHECK(sk == std::vector<uint8_t>({0, 0, 0, 0, 1, 0,  0, 0, 0, 0, 1, 0}));
+    CHECK(out[4] == out[0] && f.at(0, out[4]) == 0 && out[10] == out[6] && f.at(0, out[10]) == 1);
+    const auto n = c->counts(false);
+    CHECK(n.skipped == 1 && n.skipped_ids == 2 && n.needed == 6 + 5);
+}
+
+static void test_skip_map_rank() {
+    // (h) skip_map_rank 2 maps a skipped id to the slot of its token's rank-2 expert
+    for (int rank : {1, 2}) {
+        fake f(1, 8);
+        auto c = make(f, 16, 1, 100, {}, {0.1f, rank});
+        std::vector<int32_t> out;
+        std::vector<uint8_t> sk;
+        CHECK(remap_w(*c, 0, {0, 1, 2, 3, 4, 5}, {0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f}, 6, out, sk));
+        // rank 1 is expert 1 (position 2), rank 2 expert 0 (position 0)
+        CHECK(remap_w(*c, 0, {0, 9, 1, 2, 3, 4}, {0.8f, 0.05f, 0.9f, 0.7f, 0.6f, 0.01f}, 6, out, sk));
+        CHECK(sk[1] == 1 && f.n_loads == 6);
+        CHECK(out[1] == (rank == 1 ? out[2] : out[0]) && f.at(0, out[1]) == (rank == 1 ? 1 : 0));
+    }
+}
+
+static bool parse_args(common_params & params, std::vector<std::string> args) {
+    // the parser wants a model, which it does not open
+    args.insert(args.begin(), { "test-expert-cache", "-m", "none.gguf" });
+    std::vector<char *> argv;
+    for (auto & a : args) {
+        argv.push_back(a.data());
+    }
+    return common_params_parse((int) argv.size(), argv.data(), params, LLAMA_EXAMPLE_COMMON);
+}
+
+// what the cache's constructor throws, or "" when it accepts p
+static std::string cache_refusal(const llama_expert_cache_params & p) {
+    try {
+        llama_expert_cache c(p, 4, 16, 6);
+        return "";
+    } catch (const std::exception & e) {
+        return e.what();
+    }
+}
+
+static void test_skip_arg() {
+    for (const auto & [arg, v] : std::vector<std::pair<const char *, float>>{ { "0.05", 0.05f }, { "0", 0.0f }, { "1", 1.0f } }) {
+        common_params params;
+        CHECK_IN(arg, parse_args(params, { "--expert-cache", "16", "--expert-cache-skip", arg }));
+        CHECK_IN(arg, params.expert_cache_skip == v);
+        const llama_model_params mp = common_model_params_to_llama(params);
+        CHECK_IN(arg, mp.expert_cache && mp.expert_cache->skip_weight == v && mp.expert_cache->skip_map_rank == 1);
+    }
+    for (const char * bad : { "-0.1", "-1", "nan", "inf", "-inf", "abc", "" }) {
+        common_params params;
+        CHECK_IN(bad, !parse_args(params, { "--expert-cache-skip", bad }));
+        CHECK_IN(bad, params.expert_cache_skip == 0.0f);
+    }
+    // the default is off
+    {
+        common_params params;
+        CHECK(params.expert_cache_skip == 0.0f);
+        const llama_expert_cache_params ec = llama_expert_cache_default_params();
+        CHECK(ec.skip_weight == 0.0f && ec.skip_map_rank == 1);
+        CHECK(llama_expert_skip{}.weight == 0.0f && llama_expert_skip{}.map_rank == 1);
+    }
+    // the skip alone still hands the model its params, so that the load refuses it without a cache
+    {
+        common_params params;
+        CHECK(parse_args(params, { "--expert-cache-skip", "0.05" }));
+        const llama_model_params mp = common_model_params_to_llama(params);
+        CHECK(mp.expert_cache && mp.expert_cache->skip_weight == 0.05f && mp.expert_cache->n_slots == 0);
+    }
+#if defined(__APPLE__) || defined(__linux__)
+    // the environment variable
+    {
+        setenv("LLAMA_ARG_EXPERT_CACHE_SKIP", "0.25", 1);
+        common_params params;
+        const bool ok = parse_args(params, { "--expert-cache", "16" });
+        unsetenv("LLAMA_ARG_EXPERT_CACHE_SKIP");
+        CHECK(ok && params.expert_cache_skip == 0.25f);
+    }
+#endif
+    // the constructor's refusals
+    llama_expert_cache_params p = llama_expert_cache_default_params();
+    p.n_slots = 8;
+    CHECK(cache_refusal(p).empty());
+    p.skip_weight = 0.05f;
+    CHECK(cache_refusal(p).empty());
+    p.gpu_remap = true;
+    CHECK(cache_refusal(p).find("--expert-cache-skip") != std::string::npos);
+    p.gpu_remap = false;
+    for (int rank : {0, 3, -1}) {
+        p.skip_map_rank = rank;
+        CHECK_IN("map rank", cache_refusal(p).find("map rank") != std::string::npos);
+    }
+    p.skip_map_rank = 2;
+    CHECK(cache_refusal(p).empty());
+    for (float w : { -0.5f, NAN, INFINITY }) {
+        p.skip_weight = w;
+        CHECK_IN("weight", !cache_refusal(p).empty());
+    }
 }
 
 static void test_concurrent_misses() {
@@ -1213,6 +1431,7 @@ static void test_draft_params() {
     target.expert_cache_stats  = "stats.json";
     target.expert_cache_sidefile = "experts.side";
     target.expert_cache_gpu_remap = true;
+    target.expert_cache_skip   = 0.05f;
     const common_params draft = common_base_params_to_speculative(target);
     CHECK(draft.expert_cache == 0);
     CHECK(draft.expert_cache_layers.empty());
@@ -1220,6 +1439,7 @@ static void test_draft_params() {
     CHECK(draft.expert_cache_sidefile.empty());
     // the remap without slots is refused at load, so the draft would not load
     CHECK(!draft.expert_cache_gpu_remap);
+    CHECK(draft.expert_cache_skip == 0.0f);
     CHECK(target.expert_cache == 128);
     CHECK(target.expert_cache_gpu_remap);
 }
@@ -1242,6 +1462,12 @@ int main(int argc, char ** argv) {
     test_concurrent_misses();
     test_wait_modes();
     test_wait_arg();
+    test_skip_off();
+    test_skip_rule();
+    test_skip_loading();
+    test_skip_ubatch();
+    test_skip_map_rank();
+    test_skip_arg();
     test_preads_counted();
     test_gate_table();
     test_gate_deferred();
