@@ -395,7 +395,7 @@ static void test_wait_modes() {
     };
     for (const auto & m : modes) {
         const bool spins = m.w.mode == llama_expert_wait::SPIN;
-        const bool qos   = m.w.mode == llama_expert_wait::QOS;
+        [[maybe_unused]] const bool qos = m.w.mode == llama_expert_wait::QOS; // checked on Apple only
         char what[128];
 
         // slow demand loads: the remap waits in its main loop
