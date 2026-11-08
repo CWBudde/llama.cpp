@@ -333,6 +333,9 @@ extern "C" {
         bool            buffered;      // read misses through the page cache (macOS: no F_NOCACHE)
         const char *    sidefile_path; // optional: read misses from this side-file (kolibri-sidefile write), one pread
                                        // per expert; the load fails if its table does not match the model and the GGUF
+        bool            gpu_remap;     // map the router's ids to slots on the GPU, without a CPU split per layer
+                                       // (a cache, with n_slots or n_slots_layer; every expert layer on Metal;
+                                       // no prefetch; else the model fails to load)
     };
 
     struct llama_model_params {

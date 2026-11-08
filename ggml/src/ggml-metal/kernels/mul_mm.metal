@@ -1074,3 +1074,43 @@ template [[host_name("kernel_mul_mm_id_iq1_m_f16")]]   kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_iq4_nl_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq4_xs_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_tq2_0_f16")]]   kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  half, half2x4>;
+
+// [EXPERIMENTAL] the expert cache's gate of one layer: maps the router's ids to slots through the
+// layer's table and logs them. An id without a slot stops the command buffer: every later dispatch
+// of it is indirect, and its threadgroup counts become 0. Nothing after this gate then runs, also
+// not this layer's matmuls, and every intermediate tensor stays as the nodes before left it.
+kernel void kernel_expert_gate(
+        constant ggml_metal_kargs_expert_gate & args [[buffer(0)]],
+        device const char    * ids   [[buffer(1)]],
+        device const int32_t * table [[buffer(2)]],
+        device       int32_t * slots [[buffer(3)]],
+        device       uint32_t * words [[buffer(4)]]) {
+    device int32_t * logged = slots + args.n_log;
+
+    bool miss = false;
+    for (int t = 0; t < args.n_tokens; ++t) {
+        device const int32_t * row = (device const int32_t *) (ids + t*args.nb1);
+        for (int i = 0; i < args.n_used; ++i) {
+            const int32_t id = row[i];
+            const int32_t s  = table[id];
+
+            logged[t*args.n_used + i] = id;
+            if (s < 0) {
+                miss = true;
+            } else {
+                slots[t*args.n_used + i] = s;
+            }
+        }
+    }
+
+    if (miss) {
+        words[0] = 1;
+        words[1] = args.gate;
+        const uint32_t n = words[2];
+        for (uint32_t e = args.entry; e < n; ++e) {
+            words[args.hdr + 3*e + 0] = 0;
+            words[args.hdr + 3*e + 1] = 0;
+            words[args.hdr + 3*e + 2] = 0;
+        }
+    }
+}

@@ -543,6 +543,7 @@ struct common_params {
     std::string          expert_cache_stats;                // JSON counters, written when the model is freed (also without the cache: decode timing)
     bool                 expert_cache_buffered     = false; // read misses through the page cache
     std::string          expert_cache_sidefile;             // read misses from this side-file, one pread per expert
+    bool                 expert_cache_gpu_remap    = false; // map router ids to slots on the GPU
     llama_expert_cache_params expert_cache_lp = {};         // what common_model_params_to_llama hands to the model
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)

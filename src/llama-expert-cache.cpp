@@ -174,7 +174,11 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int 
     : n_layer(n_layer), n_expert(n_expert), n_expert_used(n_expert_used),
       n_threads(std::max(p.n_threads, 1)), prefetch_k(std::max(p.prefetch_k, 0)),
       prefetch_half_life(std::max(p.prefetch_half_life, 1)), prefetch_mix(p.prefetch_mix),
-      stats_path(p.stats_path ? p.stats_path : ""), buffered(p.buffered), sidefile_path(p.sidefile_path ? p.sidefile_path : "") {
+      stats_path(p.stats_path ? p.stats_path : ""), buffered(p.buffered), sidefile_path(p.sidefile_path ? p.sidefile_path : ""), gpu_remap_on(p.gpu_remap) {
+    if (gpu_remap_on && prefetch_k > 0) {
+        // a prefetch writes a slot while the GPU runs; the gate relies on an idle GPU for every write
+        throw std::runtime_error("expert cache: --expert-cache-gpu-remap does not work with --expert-prefetch");
+    }
     if (p.n_slots_layer && p.n_layer_slots > 0) {
         if (p.n_layer_slots != n_layer) {
             throw std::runtime_error(format("expert cache: %d per-layer slot counts for %d layers", p.n_layer_slots, n_layer));
@@ -254,6 +258,16 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
     GGML_ASSERT((int) stacked_in.size() == n_layer && (int) devs.size() == n_layer);
     stacked = stacked_in;
 
+    if (gpu_remap_on) {
+        for (int il = 0; il < n_layer; ++il) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[il]);
+            if (!reg || strcmp(ggml_backend_reg_name(reg), "MTL") != 0) {
+                throw std::runtime_error(format("expert cache: --expert-cache-gpu-remap needs every expert layer on Metal, and layer %d is on %s",
+                    il, ggml_backend_dev_name(devs[il])));
+            }
+        }
+    }
+
     // one group of slot tensors per device: the stacked tensors' first two dimensions, n_slots experts
     std::vector<int> group_of(n_layer);
     for (int il = 0; il < n_layer; ++il) {
@@ -269,7 +283,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
     }
     for (auto & gr : groups) {
         ggml_init_params ip = {
-            /*.mem_size   =*/ ggml_tensor_overhead()*3*n_layer,
+            /*.mem_size   =*/ ggml_tensor_overhead()*5*n_layer,
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -295,6 +309,22 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
             bytes += s->nb[2];
         }
         expert_bytes[il] = bytes;
+    }
+
+    if (gpu_remap_on) {
+        gate_table.resize(n_layer);
+        gate_slots.resize(n_layer);
+        for (int il = 0; il < n_layer; ++il) {
+            ggml_tensor * tb = ggml_new_tensor_1d(groups[group_of[il]].ctx, GGML_TYPE_I32, n_expert);
+            ggml_format_name(tb, "blk.%d.ffn_moe_table", il);
+            ggml_tensor * sl = ggml_new_tensor_2d(groups[group_of[il]].ctx, GGML_TYPE_I32, n_expert_used, 2*(int64_t) max_ubatch());
+            ggml_format_name(sl, "blk.%d.ffn_moe_slot_ids", il);
+            // what the Metal backend needs to know of it
+            sl->op_params[0] = il;
+            sl->op_params[1] = (int32_t) max_ubatch();
+            gate_table[il] = tb;
+            gate_slots[il] = sl;
+        }
     }
 
     for (auto & gr : groups) {
@@ -396,6 +426,9 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
     for (int il = 0; il < n_layer; ++il) {
         ud[il] = { this, il };
     }
+    for (ggml_tensor * tb : gate_table) {
+        std::fill_n((int32_t *) tb->data, n_expert, -1); // no expert has a slot yet
+    }
     slots = std::make_unique<llama_expert_slots>(n_slots, n_expert, expert_bytes, n_threads,
         [this](int il, int e, int s, uint64_t & preads) { return load(il, e, s, preads); });
     if (prefetch_k > 0) {
@@ -414,8 +447,8 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
     for (const auto & gr : groups) {
         where += format("%s%.2f MiB for %s", where.empty() ? "" : ", ", ggml_backend_buffer_get_size(gr.buf)/1024.0/1024.0, ggml_backend_dev_name(gr.dev));
     }
-    LLAMA_LOG_INFO("%s: %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, reading %s%s\n",
-        __func__, *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
+    LLAMA_LOG_INFO("%s: %s, %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, reading %s%s\n",
+        __func__, gpu_remap_on ? "GPU remap" : "CPU remap", *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
         n_expert, where.c_str(), n_threads, pf.c_str(), sidefile ? sidefile_path.c_str() : path.c_str(), buffered ? " (buffered)" : "");
 }
 
@@ -442,8 +475,55 @@ ggml_tensor * llama_expert_cache::build_remap(ggml_context * ctx0, ggml_tensor *
 
 void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
+    remap_ids(il, (const int32_t *) ids->data, (int) ggml_nelements(ids), (int) ids->ne[1], (int32_t *) dst->data);
+}
+
+void llama_expert_cache::bind_gate(ggml_tensor * mul_mat_id, int il) const {
+    if (mul_mat_id->op != GGML_OP_MUL_MAT_ID) {
+        throw std::runtime_error("expert cache: --expert-cache-gpu-remap needs plain expert matmuls (no LoRA adapter)");
+    }
+    mul_mat_id->src[3] = gate_slots[il];
+    mul_mat_id->src[4] = gate_table[il];
+}
+
+void llama_expert_cache::gate_remap(int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped) {
+    // A graph compute finds its own gates, so a layer cut in two gets two, and a second remap of the
+    // same layer would count and pin it twice. Hence no cut inside a layer, before that remap.
+    if (il <= gate_il) {
+        GGML_ABORT("expert cache: --expert-cache-gpu-remap: layer %d reached its Metal gate again in the same graph, after layer %d: "
+                   "a cb_eval that stops between a layer's matmuls cuts it in two, and this mode cannot run that", il, gate_il);
+    }
+    gate_il = il;
+    gate_seen++;
+    gate_scratch.resize(n_ids);
+    remap_ids(il, ids, n_ids, n_tokens, gate_scratch.data());
+    // only a stopped layer has new residents; the gate that resumes reads them from the table
+    if (stopped) {
+        slots->copy_table(il, (int32_t *) gate_table[il]->data);
+    }
+}
+
+void llama_expert_cache::gate_run(int n_tokens, bool stopped) {
+    const int d = n_tokens == 1;
+    gate_runs[d]++;
+    gate_stops[d] += stopped ? 1 : 0;
+}
+
+void llama_expert_cache::gate_check_graph(bool has_outputs) {
+    const int want = has_outputs ? n_layer : n_layer - 1;
+    if (gate_seen != want) {
+        GGML_ABORT("expert cache: --expert-cache-gpu-remap: %d of %d expert layers went through the Metal gate; the others left the GPU", gate_seen, want);
+    }
+    gate_abandon_graph();
+}
+
+void llama_expert_cache::gate_abandon_graph() {
+    gate_seen = 0;
+    gate_il   = -1;
+}
+
+void llama_expert_cache::remap_ids(int il, const int32_t * ids, int n_ids, int n_tokens, int32_t * out) {
     const auto t0 = std::chrono::steady_clock::now();
-    const int n_tokens = (int) ids->ne[1];
 
     // a graph runs its layers in order; layer 0 starts the next ubatch (the last layer may see
     // fewer tokens, only the outputs)
@@ -453,7 +533,7 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
         decode    = n_tokens == 1;
     }
 
-    if (!slots->remap(il, (const int32_t *) ids->data, (int) ggml_nelements(ids), decode, (int32_t *) dst->data)) {
+    if (!slots->remap(il, ids, n_ids, decode, out)) {
         int l = -1;
         int e = -1;
         if (slots->failure(l, e)) {
@@ -494,14 +574,18 @@ std::string llama_expert_cache::stats_json() const {
     const auto c_dec = slots->counts(true);
     // the remap op's own time: all of it but the wait on loads
     const auto remap = [](double op, double wait) { return format(", \"remap_seconds\": %.6f", std::max(op - wait, 0.0)); };
-    const std::string x_pre = remap(op_seconds[0], c_pre.wait_seconds);
-    const std::string x_dec = remap(op_seconds[1], c_dec.wait_seconds) + (diag ? ", " + diag->json_fields() : std::string());
+    // the GPU remap's command buffers, and those a gate stopped
+    const auto gate = [this](int d) {
+        return gpu_remap_on ? format(", \"gpu_runs\": %llu, \"gpu_stops\": %llu", (unsigned long long) gate_runs[d], (unsigned long long) gate_stops[d]) : std::string();
+    };
+    const std::string x_pre = remap(op_seconds[0], c_pre.wait_seconds) + gate(0);
+    const std::string x_dec = remap(op_seconds[1], c_dec.wait_seconds) + gate(1) + (diag ? ", " + diag->json_fields() : std::string());
     return format(
         "{\"expert_cache\": {\"slots_min\": %d, \"slots_max\": %d, \"slot_bytes\": %zu, \"expert_bytes\": %zu, "
-        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"buffered\": %s, \"file\": %s, \"sidefile\": %s}, "
+        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"buffered\": %s, \"gpu_remap\": %s, \"file\": %s, \"sidefile\": %s}, "
         "\"prefill\": %s, \"decode\": %s, \"process\": %s}",
         s_min, s_max, slot_bytes(), expert_bytes.empty() ? (size_t) 0 : expert_bytes[0],
-        n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, buffered ? "true" : "false", json_string(path).c_str(),
+        n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, buffered ? "true" : "false", gpu_remap_on ? "true" : "false", json_string(path).c_str(),
         sidefile ? json_string(sidefile_path).c_str() : "null",
         counts_json(c_pre, x_pre).c_str(), counts_json(c_dec, x_dec).c_str(),
         process_json(pc, disk_read0, pageins0, faults0).c_str());

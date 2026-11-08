@@ -572,6 +572,17 @@ typedef struct {
     uint64_t nb21;
 } ggml_metal_kargs_mul_mm_id_map0;
 
+// [EXPERIMENTAL] the expert cache's gate of one layer
+typedef struct {
+    int32_t  n_used;   // experts per token
+    int32_t  n_tokens;
+    uint64_t nb1;      // the row stride of the router's ids
+    int32_t  n_log;    // the words of the slot ids tensor before the log of the router's ids
+    uint32_t gate;     // this gate's place in the graph
+    uint32_t entry;    // the first indirect entry after this gate
+    uint32_t hdr;      // the words before the first entry
+} ggml_metal_kargs_expert_gate;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

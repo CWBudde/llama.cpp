@@ -79,6 +79,17 @@ struct ggml_metal {
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
 
+    // [EXPERIMENTAL] the expert cache's GPU remap: see ggml_metal_graph_compute_gated
+    void (*gate_remap)(void * user, int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped);
+    void (*gate_run)  (void * user, int n_tokens, bool stopped);
+    void * gate_user;
+
+    id<MTLBuffer> gate_buf; // the words of ggml_metal_encoder_gate_init
+    uint32_t      gate_cap;
+    int32_t *     gate_of_node;
+    int           gate_of_node_size;
+    int           gate_chunk; // gates per command buffer, kept across graphs
+
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
@@ -236,6 +247,9 @@ void ggml_metal_free(ggml_metal_t ctx) {
     }
 
     Block_release(ctx->encode_async);
+
+    [ctx->gate_buf release];
+    free(ctx->gate_of_node);
 
     //[ctx->queue release]; // [TAG_QUEUE_PER_BACKEND]
 
@@ -475,6 +489,205 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+// [EXPERIMENTAL] the expert cache's GPU remap: a whole graph, in one scheduler split, without a CPU
+// sync at a layer whose experts all have slots.
+//
+// Each expert layer has a gate before its first matmul (kernel_expert_gate). The graph is the
+// resident run's, node for node, so it reorders and fuses alike; the fusion table has no pattern
+// with a MUL_MAT_ID, so a command buffer can end before a gate without cutting a fused group. The
+// boundaries the plain path has (n_nodes_0, n_nodes_per_cb) stay, because a pattern across one of
+// them does not fuse there either.
+//
+// What replaces the scheduler's sync before the CPU remap, for the slots' lifetime:
+//
+//  - the table and the slots' bytes change only in gate_remap(stopped = true), called after
+//    waitUntilCompleted of the only command buffer of this graph: the GPU is idle;
+//  - a gate that stops zeroes every later dispatch of its command buffer, so that layer's matmuls
+//    have not run, and no later node has overwritten a tensor that the resumed run still reads;
+//  - the matmuls of the layers before it are complete: they precede the gate in a completed buffer;
+//  - there is no asynchronous writer: the expert cache refuses prefetch in this mode, and gate_remap
+//    returns only when its layer's loads are done.
+//
+// Hence a slot a matmul reads cannot be evicted or written while it runs, as before.
+static void ggml_metal_gate_remap(ggml_metal_t ctx, const struct ggml_tensor * op, bool stopped) {
+    const struct ggml_tensor * ids   = op->src[2];
+    const struct ggml_tensor * slots = op->src[3];
+
+    // the slot ids' tensor holds the gate's log of the router's ids behind the slot ids
+    const int32_t * logged = (const int32_t *) slots->data + ids->ne[0]*ggml_get_op_params_i32(slots, 1);
+
+    ctx->gate_remap(ctx->gate_user, ggml_get_op_params_i32(slots, 0), logged, (int) (ids->ne[0]*ids->ne[1]), (int) ids->ne[1], stopped);
+}
+
+static enum ggml_status ggml_metal_graph_compute_gated(ggml_metal_t ctx, struct ggml_cgraph * gf, int n_gates, const int * gate_node) {
+    // whatever ran before is done too: the table changes below rely on an idle GPU
+    if (ctx->cmd_buf_last) {
+        [ctx->cmd_buf_last waitUntilCompleted];
+        ctx->cmd_buf_last = nil;
+    }
+
+    // keep the memory wired
+    ggml_metal_device_rsets_keep_alive(ctx->dev);
+
+    const uint32_t cap = 16*(uint32_t) gf->n_nodes;
+    if (!ctx->gate_buf || ctx->gate_cap < cap) {
+        [ctx->gate_buf release];
+        id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
+        ctx->gate_buf = [device newBufferWithLength:(GGML_METAL_GATE_HDR + 3*(size_t) cap)*sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        if (!ctx->gate_buf) {
+            GGML_LOG_ERROR("%s: cannot allocate the expert gate's buffer\n", __func__);
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        ctx->gate_cap = cap;
+    }
+
+    uint32_t * words = (uint32_t *) [ctx->gate_buf contents];
+
+    const struct ggml_metal_op_gates gates = { ctx->gate_buf, words, ctx->gate_cap, ctx->gate_of_node };
+
+    // the plain path's encoder boundaries
+    const int n_cb    = ctx->n_cb;
+    const int n_main  = MAX(64, 0.1*gf->n_nodes);
+    const int n_0     = n_cb == 0 ? gf->n_nodes : MIN(n_main, gf->n_nodes);
+    const int per_cb  = n_cb == 0 ? 0 : (gf->n_nodes - n_0 + n_cb - 1) / n_cb;
+    const int n_nodes = gf->n_nodes;
+
+    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+
+    int pos      = 0;
+    int reported = 0; // the gates gate_remap has seen
+
+    while (pos < n_nodes) {
+        @autoreleasepool {
+            // to the next plain boundary, and over gate_chunk gates at most
+            int end = n_0;
+            if (end <= pos) {
+                end = n_nodes;
+                if (per_cb > 0) {
+                    end = n_0 + ((pos - n_0)/per_cb + 1)*per_cb;
+                    end = MIN(end, n_nodes);
+                }
+            }
+
+            if (pos > 0 && ctx->abort_callback && ctx->abort_callback(ctx->abort_callback_data)) {
+                GGML_LOG_INFO("%s: aborted between command buffers\n", __func__);
+                return GGML_STATUS_ABORTED;
+            }
+
+            int g0 = 0;
+            while (g0 < n_gates && gate_node[g0] < pos) {
+                g0++;
+            }
+            if (g0 + ctx->gate_chunk < n_gates) {
+                end = MIN(end, gate_node[g0 + ctx->gate_chunk]);
+            }
+
+            words[0] = 0;
+            words[1] = 0;
+            words[2] = 0;
+
+            id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+
+            ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, pos, end, ctx->use_concurrency, false, ctx->debug_graph);
+            ggml_metal_op_set_gates(ctx_op, &gates);
+
+            for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                const int res = ggml_metal_op_encode(ctx_op, idx);
+                if (res == 0) {
+                    break;
+                }
+                idx += res - 1;
+            }
+
+            ggml_metal_op_free(ctx_op);
+
+            [cmd_buf commit];
+            ggml_metal_count_commit();
+
+            [cmd_buf waitUntilCompleted];
+
+            const MTLCommandBufferStatus status = [cmd_buf status];
+            if (status != MTLCommandBufferStatusCompleted) {
+                GGML_LOG_ERROR("%s: error: command buffer failed with status %d\n", __func__, (int) status);
+                if (status == MTLCommandBufferStatusError) {
+                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                }
+                ctx->has_error = true;
+                return GGML_STATUS_FAILED;
+            }
+
+            // the GPU is idle now
+            const bool stopped = words[0] != 0;
+            const int  g_stop  = stopped ? (int) words[1] : -1;
+
+            int g_end = g0;
+            while (g_end < n_gates && gate_node[g_end] < end) {
+                g_end++;
+            }
+            const int g_pass = stopped ? g_stop : g_end;
+            if (stopped && (g_stop < g0 || g_stop >= g_end)) {
+                GGML_ABORT("expert gate: gate %d stopped a command buffer holding gates %d to %d", g_stop, g0, g_end - 1);
+            }
+            // gate_remap has loaded what this gate needs, so stopping again would not end
+            if (stopped && g_stop < reported) {
+                GGML_ABORT("expert gate: gate %d stopped again after its loads", g_stop);
+            }
+
+            for (int g = reported; g < g_pass; ++g) {
+                ggml_metal_gate_remap(ctx, gf->nodes[gate_node[g]], false);
+            }
+            reported = MAX(reported, g_pass);
+
+            ctx->gate_run(ctx->gate_user, (int) gf->nodes[gate_node[0]]->src[2]->ne[1], stopped);
+
+            if (stopped) {
+                // loads the misses and updates the table; the run resumes at this gate, which now passes
+                ggml_metal_gate_remap(ctx, gf->nodes[gate_node[g_stop]], true);
+                reported = g_stop + 1;
+                pos = gate_node[g_stop];
+
+                // a stop wastes the encoding of the buffer's rest, so buffers stay short while layers
+                // miss; two gates, so that the resumed layer and the next one's gate share a buffer
+                ctx->gate_chunk = 2;
+            } else {
+                pos = end;
+                ctx->gate_chunk = MIN(2*ctx->gate_chunk, MAX(n_gates, 1));
+            }
+        }
+    }
+
+    return GGML_STATUS_SUCCESS;
+}
+
+// [EXPERIMENTAL] the expert cache's gates of a graph: the first computed MUL_MAT_ID with slot ids per layer
+static int ggml_metal_find_gates(ggml_metal_t ctx, struct ggml_cgraph * gf, int ** gate_node_out) {
+    if (ctx->gate_of_node_size < gf->n_nodes) {
+        free(ctx->gate_of_node);
+        ctx->gate_of_node      = malloc(sizeof(int32_t)*gf->n_nodes);
+        ctx->gate_of_node_size = gf->n_nodes;
+    }
+    int * gate_node = NULL;
+    int   n_gates   = 0;
+    int   il_last   = -1;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ctx->gate_of_node[i] = -1;
+        struct ggml_tensor * node = gf->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID || !node->src[3] || ggml_is_empty(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        const int il = ggml_get_op_params_i32(node->src[3], 0);
+        if (il == il_last) {
+            continue;
+        }
+        il_last = il;
+        gate_node = realloc(gate_node, sizeof(int)*(n_gates + 1));
+        gate_node[n_gates] = i;
+        ctx->gate_of_node[i] = n_gates++;
+    }
+    *gate_node_out = gate_node;
+    return n_gates;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
@@ -483,6 +696,18 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     if (gf->n_nodes == 0) {
         return GGML_STATUS_SUCCESS;
+    }
+
+    // [EXPERIMENTAL] with the expert cache's GPU remap, the graph runs behind its gates
+    if (ctx->gate_remap) {
+        int * gate_node = NULL;
+        const int n_gates = ggml_metal_find_gates(ctx, gf, &gate_node);
+        if (n_gates > 0) {
+            const enum ggml_status res = ggml_metal_graph_compute_gated(ctx, gf, n_gates, gate_node);
+            free(gate_node);
+            return res;
+        }
+        free(gate_node);
     }
 
     // number of nodes encoded by the main thread (empirically determined)
@@ -726,6 +951,16 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
 
 ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
     return ctx->ev_cpy;
+}
+
+void ggml_metal_set_expert_gate(ggml_metal_t ctx,
+        void (*remap)(void * user, int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped),
+        void (*run)  (void * user, int n_tokens, bool stopped),
+        void * user) {
+    ctx->gate_remap = remap;
+    ctx->gate_run   = run;
+    ctx->gate_user  = user;
+    ctx->gate_chunk = 2;
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
