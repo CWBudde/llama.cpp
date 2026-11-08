@@ -1725,6 +1725,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         ec.buffered           = params.expert_cache_buffered;
         ec.sidefile_path      = params.expert_cache_sidefile.empty() ? nullptr : params.expert_cache_sidefile.c_str();
         ec.gpu_remap          = params.expert_cache_gpu_remap;
+        ec.wait_mode          = params.expert_cache_wait;
+        ec.wait_spin_us       = params.expert_cache_wait_us;
         mparams.expert_cache  = &ec;
     }
 

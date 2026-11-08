@@ -5,8 +5,17 @@
 #include <chrono>
 #include <cmath>
 
-llama_expert_slots::llama_expert_slots(std::vector<int> n_slots, int n_expert, std::vector<size_t> expert_bytes, int n_threads, load_fn load)
-    : n_expert(n_expert), expert_bytes(std::move(expert_bytes)), load(std::move(load)), keep(n_expert, 0) {
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <sys/qos.h>
+#endif
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <immintrin.h>
+#endif
+
+llama_expert_slots::llama_expert_slots(std::vector<int> n_slots, int n_expert, std::vector<size_t> expert_bytes, int n_threads, load_fn load,
+                                       llama_expert_wait wait)
+    : n_expert(n_expert), expert_bytes(std::move(expert_bytes)), load(std::move(load)), wait(wait), keep(n_expert, 0) {
     assert(n_slots.size() == this->expert_bytes.size());
     layers.resize(n_slots.size());
     for (size_t l = 0; l < n_slots.size(); ++l) {
@@ -65,6 +74,73 @@ bool llama_expert_slots::failure(int & l, int & e) const {
     return demand_failed;
 }
 
+// a pause hint for a busy wait: the core stays awake and at its clock, without hammering the pipeline
+static inline void cpu_relax() {
+#if defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+    __yield();
+#endif
+}
+
+// the lock released for d of busy waiting, then taken again
+static void spin_unlocked(std::unique_lock<std::mutex> & lock, std::chrono::steady_clock::duration d) {
+    lock.unlock();
+    const auto until = std::chrono::steady_clock::now() + d;
+    while (std::chrono::steady_clock::now() < until) {
+        cpu_relax();
+    }
+    lock.lock();
+}
+
+// the calling thread raised to the interactive QoS class, once per thread (Apple only)
+static void raise_qos_once() {
+#if defined(__APPLE__)
+    static thread_local bool raised = false;
+    if (!raised) {
+        raised = true;
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+#endif
+}
+
+void llama_expert_slots::wait_load(std::unique_lock<std::mutex> & lock, wait_budget & budget) {
+    constexpr auto spin_step = std::chrono::microseconds(10);
+    switch (wait.mode) {
+        case llama_expert_wait::SPIN:
+            spin_unlocked(lock, spin_step);
+            return;
+        case llama_expert_wait::HYBRID: {
+            const auto now = std::chrono::steady_clock::now();
+            if (!budget.started) {
+                budget.started  = true;
+                budget.spin_end = now + std::chrono::microseconds(wait.spin_us);
+            }
+            if (now < budget.spin_end) {
+                spin_unlocked(lock, std::min<std::chrono::steady_clock::duration>(spin_step, budget.spin_end - now));
+                return;
+            }
+            // the caller checked its predicate under this lock, which the wait releases atomically: no
+            // notify is lost between the check and the sleep
+            cv_done.wait(lock);
+            return;
+        }
+        case llama_expert_wait::QOS:
+            raise_qos_once();
+            cv_done.wait(lock);
+            return;
+        case llama_expert_wait::SLEEP:
+        default:
+            cv_done.wait(lock);
+            return;
+    }
+}
+
+// not a remap's wait: the teardown's, off the critical path, sleeps in every mode
 void llama_expert_slots::drain() {
     std::unique_lock<std::mutex> lock(mtx);
     cv_done.wait(lock, [this] { return q_demand.empty() && q_prefetch.empty() && running == 0; });
@@ -104,6 +180,7 @@ void llama_expert_slots::assign(int l, int s, int e, bool demand, bool decode) {
 bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, int32_t * out) {
     std::unique_lock<std::mutex> lock(mtx);
     auto & L = layers[l];
+    wait_budget budget; // one spin budget for all of this remap's waits
 
     for (int i = 0; i < n; ++i) {
         if (ids[i] < 0 || ids[i] >= n_expert) {
@@ -184,7 +261,7 @@ bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, i
             }
             int s;
             while ((s = pick_victim(l)) < 0) {
-                cv_done.wait(lock);
+                wait_load(lock, budget);
             }
             slot & x = L.slots[s];
             if (x.state == READY) {
@@ -225,7 +302,7 @@ bool llama_expert_slots::remap(int l, const int32_t * ids, int n, bool decode, i
         if (!pending) {
             break;
         }
-        cv_done.wait(lock);
+        wait_load(lock, budget);
     }
     c.wait_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 

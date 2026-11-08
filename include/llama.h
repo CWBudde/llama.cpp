@@ -317,6 +317,14 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    // [EXPERIMENTAL] how the expert cache's remap waits for the loads it needs
+    enum llama_expert_cache_wait {
+        LLAMA_EXPERT_CACHE_WAIT_SLEEP  = 0, // on a condition variable the I/O threads notify
+        LLAMA_EXPERT_CACHE_WAIT_SPIN   = 1, // busy: the lock released for ~10 us of spinning between two checks
+        LLAMA_EXPERT_CACHE_WAIT_HYBRID = 2, // spin for at most wait_spin_us per remap, then sleep
+        LLAMA_EXPERT_CACHE_WAIT_QOS    = 3, // sleep, the waiting thread raised once to QOS_CLASS_USER_INTERACTIVE (Apple; else sleep)
+    };
+
     // [EXPERIMENTAL] bounded cache of routed experts (Kolibri only): the stacked expert tensors stay
     // in the file, and each layer keeps at most n_slots of its experts in device memory, read on
     // demand with pread and, optionally, prefetched by a causal predictor
@@ -336,6 +344,8 @@ extern "C" {
         bool            gpu_remap;     // map the router's ids to slots on the GPU, without a CPU split per layer
                                        // (a cache, with n_slots or n_slots_layer; every expert layer on Metal;
                                        // no prefetch; else the model fails to load)
+        enum llama_expert_cache_wait wait_mode; // how a remap waits for its loads
+        int32_t         wait_spin_us;  // LLAMA_EXPERT_CACHE_WAIT_HYBRID: the spin per remap in microseconds, > 0
     };
 
     struct llama_model_params {

@@ -4,6 +4,7 @@
 // slot, which loads are queued or running, and what they cost. The loads themselves go through a
 // callback, so the logic can be tested without a model.
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -37,12 +38,27 @@ struct llama_expert_cache_counts {
                                       // compute, unless a remap awaited the prefetch (hits_loading)
 };
 
+// how a remap waits for the loads it needs (--expert-cache-wait). Every mode checks the same
+// predicate under the lock and ends on the same events; they differ in what the thread does between
+// two checks.
+struct llama_expert_wait {
+    enum mode_t {
+        SLEEP,  // on the condition variable the I/O threads notify
+        SPIN,   // busy: release the lock, spin about 10 us with a pause hint, take it again
+        HYBRID, // SPIN for at most spin_us per remap, then SLEEP
+        QOS,    // SLEEP, the waiting thread raised once to QOS_CLASS_USER_INTERACTIVE (Apple; elsewhere SLEEP)
+    };
+    mode_t mode    = SLEEP;
+    int    spin_us = 0; // HYBRID only
+};
+
 struct llama_expert_slots {
     // load(layer, expert, slot, preads) reads one expert into one slot, adds its read calls to
     // preads and returns false on failure
     using load_fn = std::function<bool(int layer, int expert, int slot, uint64_t & preads)>;
 
-    llama_expert_slots(std::vector<int> n_slots, int n_expert, std::vector<size_t> expert_bytes, int n_threads, load_fn load);
+    llama_expert_slots(std::vector<int> n_slots, int n_expert, std::vector<size_t> expert_bytes, int n_threads, load_fn load,
+                       llama_expert_wait wait = {});
     ~llama_expert_slots();
 
     llama_expert_slots(const llama_expert_slots &) = delete;
@@ -102,6 +118,16 @@ private:
         int l, slot;
     };
 
+    // the spin budget of one remap's waits (HYBRID)
+    struct wait_budget {
+        bool started = false;
+        std::chrono::steady_clock::time_point spin_end;
+    };
+
+    // one wait for a load to end: the caller holds the lock and checks its predicate again after
+    // it; the lock is held again on return
+    void wait_load(std::unique_lock<std::mutex> & lock, wait_budget & budget);
+
     int pick_victim(int l) const;
     void assign(int l, int s, int e, bool demand, bool decode);
     void worker();
@@ -110,6 +136,7 @@ private:
     const int n_expert;
     const std::vector<size_t> expert_bytes; // per layer
     load_fn load;
+    const llama_expert_wait wait;
 
     std::vector<layer> layers;
     int      in_flight = -1;

@@ -175,6 +175,20 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int 
       n_threads(std::max(p.n_threads, 1)), prefetch_k(std::max(p.prefetch_k, 0)),
       prefetch_half_life(std::max(p.prefetch_half_life, 1)), prefetch_mix(p.prefetch_mix),
       stats_path(p.stats_path ? p.stats_path : ""), buffered(p.buffered), sidefile_path(p.sidefile_path ? p.sidefile_path : ""), gpu_remap_on(p.gpu_remap) {
+    switch (p.wait_mode) {
+        case LLAMA_EXPERT_CACHE_WAIT_SLEEP:  wait.mode = llama_expert_wait::SLEEP;  break;
+        case LLAMA_EXPERT_CACHE_WAIT_SPIN:   wait.mode = llama_expert_wait::SPIN;   break;
+        case LLAMA_EXPERT_CACHE_WAIT_HYBRID: wait.mode = llama_expert_wait::HYBRID; break;
+        case LLAMA_EXPERT_CACHE_WAIT_QOS:    wait.mode = llama_expert_wait::QOS;    break;
+        default:
+            throw std::runtime_error(format("expert cache: unknown wait mode %d", (int) p.wait_mode));
+    }
+    if (wait.mode == llama_expert_wait::HYBRID) {
+        if (p.wait_spin_us < 1) {
+            throw std::runtime_error(format("expert cache: hybrid wait with a spin of %d us, want > 0", (int) p.wait_spin_us));
+        }
+        wait.spin_us = p.wait_spin_us;
+    }
     if (gpu_remap_on && prefetch_k > 0) {
         // a prefetch writes a slot while the GPU runs; the gate relies on an idle GPU for every write
         throw std::runtime_error("expert cache: --expert-cache-gpu-remap does not work with --expert-prefetch");
@@ -430,7 +444,7 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
         std::fill_n((int32_t *) tb->data, n_expert, -1); // no expert has a slot yet
     }
     slots = std::make_unique<llama_expert_slots>(n_slots, n_expert, expert_bytes, n_threads,
-        [this](int il, int e, int s, uint64_t & preads) { return load(il, e, s, preads); });
+        [this](int il, int e, int s, uint64_t & preads) { return load(il, e, s, preads); }, wait);
     if (prefetch_k > 0) {
         markov = std::make_unique<llama_expert_markov>(n_layer, n_expert, prefetch_half_life, prefetch_mix);
     }
@@ -447,9 +461,9 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
     for (const auto & gr : groups) {
         where += format("%s%.2f MiB for %s", where.empty() ? "" : ", ", ggml_backend_buffer_get_size(gr.buf)/1024.0/1024.0, ggml_backend_dev_name(gr.dev));
     }
-    LLAMA_LOG_INFO("%s: %s, %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, reading %s%s\n",
+    LLAMA_LOG_INFO("%s: %s, %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, wait %s, reading %s%s\n",
         __func__, gpu_remap_on ? "GPU remap" : "CPU remap", *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
-        n_expert, where.c_str(), n_threads, pf.c_str(), sidefile ? sidefile_path.c_str() : path.c_str(), buffered ? " (buffered)" : "");
+        n_expert, where.c_str(), n_threads, pf.c_str(), wait_name().c_str(), sidefile ? sidefile_path.c_str() : path.c_str(), buffered ? " (buffered)" : "");
 }
 
 uint32_t llama_expert_cache::max_ubatch() const {
@@ -566,6 +580,16 @@ bool llama_expert_cache::load(int il, int e, int s, uint64_t & preads) {
     return llama_expert_read_rows(fd, path, rows[il], e, dst, preads);
 }
 
+std::string llama_expert_cache::wait_name() const {
+    switch (wait.mode) {
+        case llama_expert_wait::SPIN:   return "spin";
+        case llama_expert_wait::HYBRID: return format("hybrid:%d", wait.spin_us);
+        case llama_expert_wait::QOS:    return "qos";
+        case llama_expert_wait::SLEEP:  break;
+    }
+    return "sleep";
+}
+
 std::string llama_expert_cache::stats_json() const {
     const auto pc = process_now();
     const int s_min = *std::min_element(n_slots.begin(), n_slots.end());
@@ -582,10 +606,10 @@ std::string llama_expert_cache::stats_json() const {
     const std::string x_dec = remap(op_seconds[1], c_dec.wait_seconds) + gate(1) + (diag ? ", " + diag->json_fields() : std::string());
     return format(
         "{\"expert_cache\": {\"slots_min\": %d, \"slots_max\": %d, \"slot_bytes\": %zu, \"expert_bytes\": %zu, "
-        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"buffered\": %s, \"gpu_remap\": %s, \"file\": %s, \"sidefile\": %s}, "
+        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"buffered\": %s, \"gpu_remap\": %s, \"wait\": \"%s\", \"file\": %s, \"sidefile\": %s}, "
         "\"prefill\": %s, \"decode\": %s, \"process\": %s}",
         s_min, s_max, slot_bytes(), expert_bytes.empty() ? (size_t) 0 : expert_bytes[0],
-        n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, buffered ? "true" : "false", gpu_remap_on ? "true" : "false", json_string(path).c_str(),
+        n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, buffered ? "true" : "false", gpu_remap_on ? "true" : "false", wait_name().c_str(), json_string(path).c_str(),
         sidefile ? json_string(sidefile_path).c_str() : "null",
         counts_json(c_pre, x_pre).c_str(), counts_json(c_dec, x_dec).c_str(),
         process_json(pc, disk_read0, pageins0, faults0).c_str());
