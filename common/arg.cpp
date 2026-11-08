@@ -2859,6 +2859,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_GPU_REMAP"));
     add_opt(common_arg(
+        {"--expert-cache-wait"}, "MODE",
+        "[EXPERIMENTAL] how a remap waits for the expert loads it needs: sleep (on a condition variable), spin (busy, the "
+        "lock released between checks every ~10 us), hybrid:US (spin up to US microseconds per remap, then sleep), qos (sleep, "
+        "the waiting thread raised once to QOS_CLASS_USER_INTERACTIVE; Apple only, elsewhere sleep) (default: sleep)",
+        [](common_params & params, const std::string & value) {
+            const std::string hybrid = "hybrid:";
+            if (value == "sleep") {
+                params.expert_cache_wait    = LLAMA_EXPERT_CACHE_WAIT_SLEEP;
+                params.expert_cache_wait_us = 0;
+            } else if (value == "spin") {
+                params.expert_cache_wait    = LLAMA_EXPERT_CACHE_WAIT_SPIN;
+                params.expert_cache_wait_us = 0;
+            } else if (value == "qos") {
+                params.expert_cache_wait    = LLAMA_EXPERT_CACHE_WAIT_QOS;
+                params.expert_cache_wait_us = 0;
+            } else if (value.rfind(hybrid, 0) == 0) {
+                const std::string us = value.substr(hybrid.size());
+                int n = 0;
+                if (!us.empty() && us.size() <= 9 && us.find_first_not_of("0123456789") == std::string::npos) {
+                    n = std::stoi(us);
+                }
+                if (n < 1) {
+                    throw std::invalid_argument("--expert-cache-wait " + value + ": want hybrid:US with US a positive number of microseconds");
+                }
+                params.expert_cache_wait    = LLAMA_EXPERT_CACHE_WAIT_HYBRID;
+                params.expert_cache_wait_us = n;
+            } else {
+                throw std::invalid_argument("unknown --expert-cache-wait mode '" + value + "': want sleep, spin, hybrid:US or qos");
+            }
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_WAIT"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {

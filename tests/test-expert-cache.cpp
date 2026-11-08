@@ -15,6 +15,7 @@
 
 #include "../src/llama-expert-sidefile.h"
 #include "../src/llama-expert-slots.h"
+#include "arg.h"
 #include "common.h"
 #include "speculative.h"
 
@@ -42,8 +43,15 @@
 #if defined(__APPLE__) || defined(__linux__)
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 #define HAVE_SIDEFILE_TESTS 1
+#define HAVE_THREAD_CPUTIME 1
 #endif
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <sys/qos.h>
+#endif
+#include <future>
 
 static int n_failed = 0;
 
@@ -107,9 +115,9 @@ struct fake {
     }
 };
 
-static std::unique_ptr<llama_expert_slots> make(fake & f, int n_expert, int n_threads, size_t bytes = 100) {
+static std::unique_ptr<llama_expert_slots> make(fake & f, int n_expert, int n_threads, size_t bytes = 100, llama_expert_wait wait = {}) {
     return std::make_unique<llama_expert_slots>(std::vector<int>(f.n_layer, f.n_slots), n_expert,
-        std::vector<size_t>(f.n_layer, bytes), n_threads, [&f](int l, int e, int s, uint64_t & preads) { preads++; return f.load(l, e, s); });
+        std::vector<size_t>(f.n_layer, bytes), n_threads, [&f](int l, int e, int s, uint64_t & preads) { preads++; return f.load(l, e, s); }, wait);
 }
 
 // every id maps to a slot that holds it
@@ -320,6 +328,201 @@ static void test_stress() {
 
 // a layer's misses are issued concurrently over the I/O threads: all four threads are inside a load
 // of one remap at once, or no load gets past the barrier (and a timeout fails the check)
+#define CHECK_IN(what, cond) do { if (!(cond)) { fprintf(stderr, "%s:%d: FAIL %s: %s\n", __FILE__, __LINE__, what, #cond); n_failed++; } } while (0)
+
+// what a waiting thread saw
+struct waited {
+    bool   ok   = false;
+    double wall = 0;  // seconds in the call
+    double cpu  = -1; // the thread's CPU seconds in the call, -1 where unknown
+    int    qos_before = -1; // the thread's QoS class before and after the call (Apple), else -1
+    int    qos_after  = -1;
+};
+
+static double thread_cpu_seconds() {
+#ifdef HAVE_THREAD_CPUTIME
+    timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+#else
+    return -1;
+#endif
+}
+
+// runs fn on a new thread, as the decode thread that waits for loads. A wait that does not end
+// within 5 s fails the test and ends the process at once: the cache that holds the waiter cannot
+// be destroyed, so the test must not hang on it.
+static waited on_thread(const char * what, const std::function<bool()> & fn) {
+    auto done = std::make_shared<std::promise<waited>>();
+    auto res  = done->get_future();
+    std::thread t([done, fn] {
+        waited w;
+#ifdef __APPLE__
+        w.qos_before = (int) qos_class_self();
+#endif
+        const double c0 = thread_cpu_seconds();
+        const auto   t0 = std::chrono::steady_clock::now();
+        w.ok   = fn();
+        w.wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        w.cpu  = c0 < 0 ? -1 : thread_cpu_seconds() - c0;
+#ifdef __APPLE__
+        w.qos_after = (int) qos_class_self();
+#endif
+        done->set_value(w);
+    });
+    if (res.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        fprintf(stderr, "%s:%d: FAIL %s: the wait did not end within 5 s\n", __FILE__, __LINE__, what);
+        fflush(stderr);
+        std::_Exit(1);
+    }
+    t.join();
+    return res.get();
+}
+
+// every wait mode: a remap that waits for slow demand loads, one that waits for a loading slot to
+// become a victim, and one whose demand load fails all end, with the expert each slot holds; spin
+// burns the waiting core and the others do not; qos raises the waiting thread and the others leave it
+static void test_wait_modes() {
+    struct mode {
+        const char *      name;
+        llama_expert_wait w;
+    };
+    const mode modes[] = {
+        { "sleep",     { llama_expert_wait::SLEEP,  0 } },
+        { "spin",      { llama_expert_wait::SPIN,   0 } },
+        { "hybrid:50", { llama_expert_wait::HYBRID, 50 } },
+        { "qos",       { llama_expert_wait::QOS,    0 } },
+    };
+    for (const auto & m : modes) {
+        const bool spins = m.w.mode == llama_expert_wait::SPIN;
+        const bool qos   = m.w.mode == llama_expert_wait::QOS;
+        char what[128];
+
+        // slow demand loads: the remap waits in its main loop
+        {
+            fake f(1, 4);
+            f.delay_us = 2000;
+            auto c = make(f, 10, 2, 100, m.w);
+            std::vector<int32_t> out;
+            snprintf(what, sizeof(what), "wait %s, slow demand loads", m.name);
+            const waited r = on_thread(what, [&] { return remap(*c, 0, {1, 2, 3}, out); });
+            CHECK_IN(what, r.ok && mapped(f, 0, {1, 2, 3}, out));
+            const auto n = c->counts(true);
+            CHECK_IN(what, n.misses == 3 && n.loads == 3 && n.wait_seconds > 0.001 && n.wait_seconds <= r.wall);
+#ifdef __APPLE__
+            CHECK_IN(what, qos ? r.qos_after == (int) QOS_CLASS_USER_INTERACTIVE : r.qos_after == r.qos_before);
+#endif
+        }
+
+        // two slots, a needed expert and a gated prefetch: the miss waits for the prefetch's slot,
+        // then for its own load (test_pinned_loading)
+        {
+            fake f(2, 2);
+            f.gated.insert({1, 3});
+            auto c = make(f, 10, 2, 100, m.w);
+            std::vector<int32_t> out;
+            CHECK(remap(*c, 1, {5}, out));
+            CHECK(remap(*c, 0, {0}, out));
+            const int p = 3;
+            c->prefetch(1, &p, 1, true);
+            f.wait_busy(1);
+            snprintf(what, sizeof(what), "wait %s, loading victim", m.name);
+            waited r;
+            {
+                opener o(f);
+                r = on_thread(what, [&] { return remap(*c, 1, {5, 7}, out); });
+            }
+            CHECK_IN(what, r.ok && mapped(f, 1, {5, 7}, out) && !f.overlap);
+            CHECK_IN(what, c->slot_of(1, 3) < 0 && c->counts(true).prefetch_wasted == 1);
+            CHECK_IN(what, r.wall > 0.005);
+            if (r.cpu >= 0) {
+                // the gate opens after 20 ms: a spin keeps the core busy, a sleep (or a 50 us spin) does not
+                CHECK_IN(what, spins ? r.cpu > 0.3 * r.wall : r.cpu < 0.3 * r.wall);
+            }
+        }
+
+        // a failed demand load ends the wait
+        {
+            fake f(1, 2);
+            f.delay_us = 2000;
+            f.failing.insert({0, 4});
+            auto c = make(f, 10, 1, 100, m.w);
+            std::vector<int32_t> out;
+            snprintf(what, sizeof(what), "wait %s, failed load", m.name);
+            const waited r = on_thread(what, [&] { return remap(*c, 0, {4}, out); });
+            int l = -1, e = -1;
+            CHECK_IN(what, !r.ok && c->failure(l, e) && l == 0 && e == 4);
+        }
+
+        // random ubatches and prefetches with slow loads, as test_stress, shorter
+        {
+            fake f(4, 8);
+            f.delay_us = 50;
+            auto c = make(f, 32, 4, 100, m.w);
+            std::mt19937 rng(11);
+            snprintf(what, sizeof(what), "wait %s, stress", m.name);
+            const waited r = on_thread(what, [&] {
+                std::vector<int32_t> out;
+                bool ok = true;
+                for (int step = 0; step < 200 && ok; ++step) {
+                    const int l = step % 4;
+                    std::vector<int32_t> ids(1 + rng() % 6);
+                    for (auto & id : ids) {
+                        id = (int32_t) (rng() % 32);
+                    }
+                    ok = remap(*c, l, ids, out) && mapped(f, l, ids, out);
+                    const int pf[] = { (int) (rng() % 32), (int) (rng() % 32) };
+                    c->prefetch((l + 2) % 4, pf, 2, true);
+                }
+                return ok;
+            });
+            CHECK_IN(what, r.ok && !f.overlap);
+        }
+    }
+}
+
+// --expert-cache-wait: the four modes reach the model's params; anything else is refused
+static void test_wait_arg() {
+    struct good {
+        const char *            arg;
+        llama_expert_cache_wait mode;
+        int32_t                 us;
+    };
+    const good goods[] = {
+        { "sleep",     LLAMA_EXPERT_CACHE_WAIT_SLEEP,  0 },
+        { "spin",      LLAMA_EXPERT_CACHE_WAIT_SPIN,   0 },
+        { "hybrid:50", LLAMA_EXPERT_CACHE_WAIT_HYBRID, 50 },
+        { "qos",       LLAMA_EXPERT_CACHE_WAIT_QOS,    0 },
+    };
+    // the parser wants a model, which it does not open
+    auto parse = [](common_params & params, std::vector<std::string> args) {
+        args.insert(args.begin(), { "test-expert-cache", "-m", "none.gguf" });
+        std::vector<char *> argv;
+        for (auto & a : args) {
+            argv.push_back(a.data());
+        }
+        return common_params_parse((int) argv.size(), argv.data(), params, LLAMA_EXAMPLE_COMMON);
+    };
+    for (const auto & g : goods) {
+        common_params params;
+        CHECK_IN(g.arg, parse(params, { "--expert-cache", "16", "--expert-cache-wait", g.arg }));
+        CHECK_IN(g.arg, params.expert_cache_wait == g.mode && params.expert_cache_wait_us == g.us);
+        const llama_model_params mp = common_model_params_to_llama(params);
+        CHECK_IN(g.arg, mp.expert_cache && mp.expert_cache->wait_mode == g.mode && mp.expert_cache->wait_spin_us == g.us);
+    }
+    for (const char * bad : { "busy", "", "SPIN", "spin:5", "hybrid", "hybrid:", "hybrid:0", "hybrid:-5", "hybrid:5x", "qos:1" }) {
+        common_params params;
+        CHECK_IN(bad, !parse(params, { "--expert-cache-wait", bad }));
+        CHECK_IN(bad, params.expert_cache_wait == LLAMA_EXPERT_CACHE_WAIT_SLEEP);
+    }
+    // the default is the sleep
+    common_params params;
+    CHECK(params.expert_cache_wait == LLAMA_EXPERT_CACHE_WAIT_SLEEP && params.expert_cache_wait_us == 0);
+    const llama_expert_cache_params ec = llama_expert_cache_default_params();
+    CHECK(ec.wait_mode == LLAMA_EXPERT_CACHE_WAIT_SLEEP && ec.wait_spin_us == 0);
+    CHECK(llama_expert_wait{}.mode == llama_expert_wait::SLEEP);
+}
+
 static void test_concurrent_misses() {
     std::atomic<int> inside{0};
     std::atomic<int> most{0};
@@ -1037,6 +1240,8 @@ int main(int argc, char ** argv) {
     test_failures();
     test_stress();
     test_concurrent_misses();
+    test_wait_modes();
+    test_wait_arg();
     test_preads_counted();
     test_gate_table();
     test_gate_deferred();

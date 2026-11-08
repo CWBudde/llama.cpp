@@ -3469,6 +3469,8 @@ llama_expert_cache_params llama_expert_cache_default_params() {
         /*.buffered           =*/ false,
         /*.sidefile_path      =*/ nullptr,
         /*.gpu_remap          =*/ false,
+        /*.wait_mode          =*/ LLAMA_EXPERT_CACHE_WAIT_SLEEP,
+        /*.wait_spin_us       =*/ 0,
     };
 
     return result;

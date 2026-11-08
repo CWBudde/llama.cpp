@@ -119,6 +119,9 @@ struct llama_expert_cache {
 
     std::string stats_json() const;
 
+    // the wait mode as --expert-cache-wait spells it
+    std::string wait_name() const;
+
 private:
     bool load(int il, int e, int s, uint64_t & preads);
 
@@ -132,6 +135,7 @@ private:
     bool buffered; // misses read through the page cache
     std::string sidefile_path;
     bool gpu_remap_on;
+    llama_expert_wait wait; // how a remap waits for its loads
 
     std::vector<tensors>  stacked;
     std::vector<tensors>  slot_t; // the slot tensors; offs unused
