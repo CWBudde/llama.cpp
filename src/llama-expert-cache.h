@@ -104,8 +104,10 @@ struct llama_expert_cache {
     // whether waves are on: asked for, and every layer has at least 3*n_expert_used slots
     bool waves_on() const;
 
-    // the waves layer il's expert matmuls take for a ubatch of n_tokens, 1 when its experts always fit
-    int n_waves(int il, int n_tokens) const;
+    // the waves layer il's expert matmuls take for a ubatch of n_tokens that routes k experts per
+    // token (the graph's top-k: warmup routes all experts, some models a per-layer k), 1 when its
+    // experts always fit or k leaves no room for waves (then the ubatch takes the plain remap)
+    int n_waves(int il, int n_tokens, int k) const;
 
     // the graph nodes the waves add for a ubatch of n_tokens
     uint32_t wave_nodes(int n_tokens) const;

@@ -2371,7 +2371,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (expert_cache && il >= 0) {
         GGML_ASSERT(!slots);
         GGML_ASSERT(!gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s);
-        n_waves = expert_cache->n_waves(il, (int) n_tokens);
+        n_waves = expert_cache->n_waves(il, (int) n_tokens, (int) n_expert_used);
         if (gated) {
             // the GPU remap keeps the graph the resident run has: the router's ids stay the inputs, and
             // the Metal backend's gate gives the matmuls the slot ids. The ubatch fits the slots, so

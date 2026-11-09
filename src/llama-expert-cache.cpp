@@ -235,7 +235,7 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int 
     }
     wud.resize(n_layer);
     for (int il = 0; il < n_layer; ++il) {
-        for (int w = 0; w < n_waves(il, n_expert); ++w) {
+        for (int w = 0; w < n_waves(il, n_expert, n_expert_used); ++w) {
             wud[il].push_back({this, il, w});
         }
     }
@@ -511,18 +511,20 @@ bool llama_expert_cache::waves_on() const {
     return waves && llama_expert_wave_cap(*std::min_element(n_slots.begin(), n_slots.end()), n_expert_used) > 0;
 }
 
-int llama_expert_cache::n_waves(int il, int n_tokens) const {
-    const int n_touch = (int) std::min<int64_t>(n_expert, (int64_t) n_tokens*n_expert_used);
-    if (!waves_on() || n_touch <= n_slots[il]) {
+int llama_expert_cache::n_waves(int il, int n_tokens, int k) const {
+    // a k up to n_expert_used takes at most the waves allocated for it (wud); a larger k (warmup
+    // routes all experts) leaves no room for waves
+    const int n_touch = (int) std::min<int64_t>(n_expert, (int64_t) n_tokens*k);
+    if (!waves_on() || k > n_expert_used || n_touch <= n_slots[il]) {
         return 1;
     }
-    return llama_expert_wave_count(n_touch, n_slots[il], n_expert_used);
+    return llama_expert_wave_count(n_touch, n_slots[il], k);
 }
 
 uint32_t llama_expert_cache::wave_nodes(int n_tokens) const {
     uint32_t n = 0;
     for (int il = 0; il < n_layer; ++il) {
-        const int nw = n_waves(il, n_tokens);
+        const int nw = n_waves(il, n_tokens, n_expert_used);
         if (nw > 1) {
             n += 32u*nw; // per wave: the two ops, a dependency view, the expert matmuls and activation, mask and sum
         }
@@ -664,20 +666,21 @@ void llama_expert_cache::remap_ids(int il, const int32_t * ids, int n_ids, int n
 }
 
 void llama_expert_cache::wave_ids(int il, int w, const ggml_tensor * ids, ggml_tensor * dst) {
-    GGML_ASSERT(ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ids->ne[0] == n_expert_used);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
+    const int k = (int) ids->ne[0]; // the graph's top-k, which n_waves planned the graph with
     const auto t0 = std::chrono::steady_clock::now();
     const int n_tokens = (int) ids->ne[1];
     const int n = (int) ggml_nelements(ids);
     const auto * id = (const int32_t *) ids->data;
     if (w == 0) {
         begin(il, n_tokens);
-        const int n_touch   = (int) std::min<int64_t>(n_expert, (int64_t) n_tokens*n_expert_used);
-        const int n_planned = slots->plan_waves(il, id, n, n_expert_used, llama_expert_wave_cap(n_slots[il], n_expert_used),
-            llama_expert_wave_count(n_touch, n_slots[il], n_expert_used));
+        const int n_built   = n_waves(il, n_tokens, k);
+        GGML_ASSERT(n_built > 1);
+        const int n_planned = slots->plan_waves(il, id, n, k, llama_expert_wave_cap(n_slots[il], k), n_built);
         GGML_ASSERT(n_planned >= 0 && n_planned <= (int) wud[il].size());
         observe(il);
     }
-    if (!slots->stage_wave(il, w, id, n, n_expert_used, (int32_t *) dst->data)) {
+    if (!slots->stage_wave(il, w, id, n, k, (int32_t *) dst->data)) {
         fail(il, n_tokens);
     }
     op_seconds[decode] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
