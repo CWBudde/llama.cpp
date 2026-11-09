@@ -2586,6 +2586,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.expert_cache_stats.clear();
     result.expert_cache_sidefile.clear();
     result.expert_cache_gpu_remap = false;
+    result.expert_cache_waves     = false;
 
     if (has_draft) {
         // default to global devices value
