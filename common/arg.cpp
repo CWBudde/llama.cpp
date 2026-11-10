@@ -2899,8 +2899,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_EXPERT_CACHE_WAVES"));
     add_opt(common_arg(
         {"--expert-cache-skip"}, "W",
-        "[EXPERIMENTAL, lossy] in a ubatch of one token (decode), do not read an expert that is not in the cache when the router chose it "
-        "at weight rank 4 or below of the token with a weight below W: its weight becomes 0. Needs --expert-cache-gpu-remap, "
+        "[EXPERIMENTAL, lossy] where a layer computes one token (every decode step, and the last layer of a prompt with one output), do not "
+        "read an expert that is not in the cache when the router chose it at weight rank 4 or below of the token with a weight below W: "
+        "its weight becomes 0. Needs --expert-cache-gpu-remap, "
         "whose Metal gate applies it; otherwise the model fails to load (default: 0, off)",
         [](common_params & params, const std::string & value) {
             size_t pos = 0;

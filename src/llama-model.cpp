@@ -1748,6 +1748,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (arch != LLM_ARCH_KOLIBRI1) {
                 throw std::runtime_error(format("the expert cache supports the kolibri1 architecture only, not %s", llm_arch_name(arch)));
             }
+            // the skip's gate zeroes entries of the router weights tensor, which must then be the tensor the
+            // experts are weighted with: normalised or softmax weights are a view of another one
+            if (params.expert_cache->skip_weight != 0.0f &&
+                    (hparams.expert_weights_norm || hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT)) {
+                throw std::runtime_error("expert cache: --expert-cache-skip does not work with normalised or softmax router weights");
+            }
             // the stacked experts stay in the file: lazy tensors, mapped on the CPU and never read
             ml.lazy.mode = LLAMA_LAZY_MODE_ON;
         }

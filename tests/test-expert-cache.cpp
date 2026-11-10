@@ -583,6 +583,11 @@ static void test_skip_arg() {
     }
     p.skip_map_rank = 2;
     CHECK(refusal(p).empty());
+    // with the skip off the rank is not read: zero-initialised params still load
+    p.skip_weight   = 0.0f;
+    p.skip_map_rank = 0;
+    CHECK(refusal(p).empty());
+    p.skip_map_rank = 1;
     for (float w : { -0.5f, NAN, INFINITY }) {
         p.skip_weight = w;
         CHECK_IN("weight", refusal(p).find("skip weight") != std::string::npos);

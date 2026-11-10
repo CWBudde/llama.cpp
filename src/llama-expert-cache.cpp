@@ -212,11 +212,11 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int 
     if (!std::isfinite(p.skip_weight) || p.skip_weight < 0) {
         throw std::runtime_error(format("expert cache: skip weight %g, want a finite weight >= 0", (double) p.skip_weight));
     }
-    if (p.skip_map_rank != 1 && p.skip_map_rank != 2) {
+    if (p.skip_weight > 0 && p.skip_map_rank != 1 && p.skip_map_rank != 2) {
         throw std::runtime_error(format("expert cache: skip map rank %d, want 1 or 2", (int) p.skip_map_rank));
     }
     skip_weight   = p.skip_weight;
-    skip_map_rank = p.skip_map_rank;
+    skip_map_rank = p.skip_weight > 0 ? p.skip_map_rank : 1;
     if (skip_on() && !gpu_remap_on) {
         // the rule lives in the Metal gate, which ranks the weights and zeroes them in place
         throw std::runtime_error("expert cache: --expert-cache-skip needs --expert-cache-gpu-remap");
