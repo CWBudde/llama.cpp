@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -126,12 +127,12 @@ void wave_mask_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
 std::string counts_json(const llama_expert_cache_counts & c, const std::string & extra) {
     return format(
         "{\"steps\": %llu, \"needed\": %llu, \"hits\": %llu, \"hits_loading\": %llu, \"misses\": %llu, "
-        "\"evictions\": %llu, \"demand_bytes\": %llu, \"prefetch_bytes\": %llu, \"prefetch_issued\": %llu, "
+        "\"skipped\": %llu, \"evictions\": %llu, \"demand_bytes\": %llu, \"prefetch_bytes\": %llu, \"prefetch_issued\": %llu, "
         "\"prefetch_used\": %llu, \"prefetch_wasted\": %llu, \"prefetch_cancelled\": %llu, "
         "\"prefetch_skipped\": %llu, \"load_failures\": %llu, \"wait_seconds\": %.6f, \"io_seconds\": %.6f, "
         "\"io_prefetch_seconds\": %.6f, \"loads\": %llu, \"preads\": %llu, \"waves\": %llu, \"waves_built\": %llu, \"wave_parked\": %llu%s}",
         (unsigned long long) c.steps, (unsigned long long) c.needed, (unsigned long long) c.hits,
-        (unsigned long long) c.hits_loading, (unsigned long long) c.misses, (unsigned long long) c.evictions,
+        (unsigned long long) c.hits_loading, (unsigned long long) c.misses, (unsigned long long) c.skipped, (unsigned long long) c.evictions,
         (unsigned long long) c.demand_bytes, (unsigned long long) c.prefetch_bytes,
         (unsigned long long) c.prefetch_issued, (unsigned long long) c.prefetch_used,
         (unsigned long long) c.prefetch_wasted, (unsigned long long) c.prefetch_cancelled,
@@ -207,6 +208,18 @@ llama_expert_cache::llama_expert_cache(const llama_expert_cache_params & p, int 
             throw std::runtime_error(format("expert cache: hybrid wait with a spin of %d us, want > 0", (int) p.wait_spin_us));
         }
         wait.spin_us = p.wait_spin_us;
+    }
+    if (!std::isfinite(p.skip_weight) || p.skip_weight < 0) {
+        throw std::runtime_error(format("expert cache: skip weight %g, want a finite weight >= 0", (double) p.skip_weight));
+    }
+    if (p.skip_map_rank != 1 && p.skip_map_rank != 2) {
+        throw std::runtime_error(format("expert cache: skip map rank %d, want 1 or 2", (int) p.skip_map_rank));
+    }
+    skip_weight   = p.skip_weight;
+    skip_map_rank = p.skip_map_rank;
+    if (skip_on() && !gpu_remap_on) {
+        // the rule lives in the Metal gate, which ranks the weights and zeroes them in place
+        throw std::runtime_error("expert cache: --expert-cache-skip needs --expert-cache-gpu-remap");
     }
     if (gpu_remap_on && prefetch_k > 0) {
         // a prefetch writes a slot while the GPU runs; the gate relies on an idle GPU for every write
@@ -365,6 +378,9 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
             // what the Metal backend needs to know of it
             sl->op_params[0] = il;
             sl->op_params[1] = (int32_t) gate_ubatch();
+            // [lossy] the skip's threshold, as bits, and the rank its ids map to
+            memcpy(&sl->op_params[2], &skip_weight, sizeof(float));
+            sl->op_params[3] = skip_map_rank;
             gate_table[il] = tb;
             gate_slots[il] = sl;
         }
@@ -490,10 +506,11 @@ void llama_expert_cache::init(const std::vector<tensors> & stacked_in, const std
     for (const auto & gr : groups) {
         where += format("%s%.2f MiB for %s", where.empty() ? "" : ", ", ggml_backend_buffer_get_size(gr.buf)/1024.0/1024.0, ggml_backend_dev_name(gr.dev));
     }
-    LLAMA_LOG_INFO("%s: %s, %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, wait %s, reading %s%s%s\n",
+    const std::string sk = skip_on() ? format(", skip of one-token misses at rank >= 4 below %g (lossy)", (double) skip_weight) : std::string();
+    LLAMA_LOG_INFO("%s: %s, %d to %d slots per layer of %d experts, %s, %d I/O threads, prefetch %s, wait %s, reading %s%s%s%s\n",
         __func__, gpu_remap_on ? "GPU remap" : "CPU remap", *std::min_element(n_slots.begin(), n_slots.end()), *std::max_element(n_slots.begin(), n_slots.end()),
         n_expert, where.c_str(), n_threads, pf.c_str(), wait_name().c_str(), sidefile ? sidefile_path.c_str() : path.c_str(), buffered ? " (buffered)" : "",
-        waves_on() ? ", waves" : "");
+        waves_on() ? ", waves" : "", sk.c_str());
 }
 
 uint32_t llama_expert_cache::max_ubatch() const {
@@ -554,12 +571,18 @@ void llama_expert_cache::remap(int il, const ggml_tensor * ids, ggml_tensor * ds
     remap_ids(il, (const int32_t *) ids->data, (int) ggml_nelements(ids), (int) ids->ne[1], (int32_t *) dst->data);
 }
 
-void llama_expert_cache::bind_gate(ggml_tensor * mul_mat_id, int il) const {
+void llama_expert_cache::bind_gate(ggml_tensor * mul_mat_id, int il, ggml_tensor * weights) const {
     if (mul_mat_id->op != GGML_OP_MUL_MAT_ID) {
         throw std::runtime_error("expert cache: --expert-cache-gpu-remap needs plain expert matmuls (no LoRA adapter)");
     }
     mul_mat_id->src[3] = gate_slots[il];
     mul_mat_id->src[4] = gate_table[il];
+    // [lossy] the skip: the gate ranks the ids' weights and zeroes those of the ids it skips, so the
+    // weights are computed before the matmul, and nothing may read them before it
+    if (weights) {
+        GGML_ASSERT(skip_on() && weights->type == GGML_TYPE_F32);
+        mul_mat_id->src[5] = weights;
+    }
 }
 
 void llama_expert_cache::gate_remap(int il, const int32_t * ids, int n_ids, int n_tokens, bool stopped) {
@@ -572,7 +595,24 @@ void llama_expert_cache::gate_remap(int il, const int32_t * ids, int n_ids, int 
     gate_il = il;
     gate_seen++;
     gate_scratch.resize(n_ids);
-    remap_ids(il, ids, n_ids, n_tokens, gate_scratch.data());
+    // [lossy] the gate logs an id it skipped as -1 - id: it is counted, and neither pinned nor loaded
+    int n_kept = n_ids;
+    if (skip_on() && n_tokens == 1) {
+        gate_kept.clear();
+        for (int i = 0; i < n_ids; ++i) {
+            if (ids[i] >= 0) {
+                gate_kept.push_back(ids[i]);
+            }
+        }
+        n_kept = (int) gate_kept.size();
+        // ranks 1 to 3 are never skipped
+        GGML_ASSERT(n_kept >= std::min(n_ids, 3));
+        ids = gate_kept.data();
+    }
+    remap_ids(il, ids, n_kept, n_tokens, gate_scratch.data());
+    if (n_kept < n_ids) {
+        slots->add_skipped(decode, n_ids - n_kept);
+    }
     // only a stopped layer has new residents; the gate that resumes reads them from the table
     if (stopped) {
         slots->copy_table(il, (int32_t *) gate_table[il]->data);
@@ -729,11 +769,11 @@ std::string llama_expert_cache::stats_json() const {
     const std::string x_dec = remap(op_seconds[1], c_dec.wait_seconds) + gate(1) + (diag ? ", " + diag->json_fields() : std::string());
     return format(
         "{\"expert_cache\": {\"slots_min\": %d, \"slots_max\": %d, \"slot_bytes\": %zu, \"expert_bytes\": %zu, "
-        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"buffered\": %s, \"gpu_remap\": %s, \"wait\": \"%s\", \"waves\": %s, \"file\": %s, \"sidefile\": %s}, "
+        "\"io_threads\": %d, \"prefetch_k\": %d, \"prefetch_half_life\": %d, \"prefetch_mix\": %g, \"buffered\": %s, \"gpu_remap\": %s, \"wait\": \"%s\", \"waves\": %s, \"skip_weight\": %g, \"file\": %s, \"sidefile\": %s}, "
         "\"prefill\": %s, \"decode\": %s, \"process\": %s}",
         s_min, s_max, slot_bytes(), expert_bytes.empty() ? (size_t) 0 : expert_bytes[0],
         n_threads, markov ? prefetch_k : 0, prefetch_half_life, prefetch_mix, buffered ? "true" : "false", gpu_remap_on ? "true" : "false", wait_name().c_str(),
-        waves_on() ? "true" : "false", json_string(path).c_str(), sidefile ? json_string(sidefile_path).c_str() : "null",
+        waves_on() ? "true" : "false", (double) skip_weight, json_string(path).c_str(), sidefile ? json_string(sidefile_path).c_str() : "null",
         counts_json(c_pre, x_pre).c_str(), counts_json(c_dec, x_dec).c_str(),
         process_json(pc, disk_read0, pageins0, faults0).c_str());
 }

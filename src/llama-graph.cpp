@@ -2389,6 +2389,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps = expert_cache->down(il);
     }
 
+    // [EXPERIMENTAL, lossy] the skip: the gate of a one-token graph zeroes the weights of the ids it skips,
+    // in place, before the layer's matmuls; the product with the experts below reads them after
+    ggml_tensor * skip_weights = nullptr;
+    if (gated && expert_cache->skip_on() && n_tokens == 1) {
+        GGML_ASSERT(!weight_before_ffn && "the expert cache's skip needs the weights applied after the experts");
+        // the gate writes the tensor, so it must own its data: a view would zero the probabilities of
+        // what it views. No node is added, so that the graph fuses and rounds as without the skip
+        GGML_ASSERT(weights->view_src == nullptr && ggml_is_contiguous(weights));
+        skip_weights = weights;
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2434,7 +2445,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // separate gate and up path
             up = build_lora_mm_id(up_exps, cur, ids_mm, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
             if (gated) {
-                expert_cache->bind_gate(up, il);
+                expert_cache->bind_gate(up, il, skip_weights);
             }
             cb(up, "ffn_moe_up", il);
 
@@ -2450,7 +2461,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (gate_exps) {
                 cur = build_lora_mm_id(gate_exps, cur, ids_mm, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
                 if (gated) {
-                    expert_cache->bind_gate(cur, il);
+                    expert_cache->bind_gate(cur, il, skip_weights);
                 }
                 cb(cur, "ffn_moe_gate", il);
             } else {
@@ -2565,7 +2576,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
             experts = build_lora_mm_id(down_exps, cur, ids_mm, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
             if (gated) {
-                expert_cache->bind_gate(experts, il);
+                expert_cache->bind_gate(experts, il, skip_weights);
             }
             //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
             cb(experts, "ffn_moe_down", il);

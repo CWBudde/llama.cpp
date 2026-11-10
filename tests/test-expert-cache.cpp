@@ -524,6 +524,71 @@ static void test_wait_arg() {
     CHECK(llama_expert_wait{}.mode == llama_expert_wait::SLEEP);
 }
 
+// --expert-cache-skip: a finite weight >= 0 reaches the model's params; the cache refuses it without
+// the GPU remap, whose Metal gate applies it (the rule itself is checked on a model, by
+// check_expert_cache.py --skip-only)
+static void test_skip_arg() {
+    auto parse = [](common_params & params, std::vector<std::string> args) {
+        args.insert(args.begin(), { "test-expert-cache", "-m", "none.gguf" });
+        std::vector<char *> argv;
+        for (auto & a : args) {
+            argv.push_back(a.data());
+        }
+        return common_params_parse((int) argv.size(), argv.data(), params, LLAMA_EXAMPLE_COMMON);
+    };
+    auto refusal = [](const llama_expert_cache_params & p) -> std::string {
+        try {
+            llama_expert_cache c(p, 4, 16, 6);
+            return "";
+        } catch (const std::exception & e) {
+            return e.what();
+        }
+    };
+    for (const auto & [arg, v] : std::vector<std::pair<const char *, float>>{ { "0.05", 0.05f }, { "0", 0.0f }, { "1", 1.0f } }) {
+        common_params params;
+        CHECK_IN(arg, parse(params, { "--expert-cache", "16", "--expert-cache-gpu-remap", "--expert-cache-skip", arg }));
+        CHECK_IN(arg, params.expert_cache_skip == v);
+        const llama_model_params mp = common_model_params_to_llama(params);
+        CHECK_IN(arg, mp.expert_cache && mp.expert_cache->skip_weight == v && mp.expert_cache->skip_map_rank == 1 && mp.expert_cache->gpu_remap);
+    }
+    for (const char * bad : { "-0.1", "-1", "nan", "inf", "-inf", "abc", "" }) {
+        common_params params;
+        CHECK_IN(bad, !parse(params, { "--expert-cache-skip", bad }));
+        CHECK_IN(bad, params.expert_cache_skip == 0.0f);
+    }
+    // the default is off
+    {
+        common_params params;
+        CHECK(params.expert_cache_skip == 0.0f);
+        const llama_expert_cache_params ec = llama_expert_cache_default_params();
+        CHECK(ec.skip_weight == 0.0f && ec.skip_map_rank == 1);
+    }
+    // the skip alone still hands the model its params, so that the load refuses it without a cache
+    {
+        common_params params;
+        CHECK(parse(params, { "--expert-cache-skip", "0.05" }));
+        const llama_model_params mp = common_model_params_to_llama(params);
+        CHECK(mp.expert_cache && mp.expert_cache->skip_weight == 0.05f && mp.expert_cache->n_slots == 0);
+    }
+    // the constructor's refusals
+    llama_expert_cache_params p = llama_expert_cache_default_params();
+    p.n_slots     = 8;
+    p.skip_weight = 0.05f;
+    CHECK(refusal(p).find("--expert-cache-skip needs --expert-cache-gpu-remap") != std::string::npos);
+    p.gpu_remap = true;
+    CHECK(refusal(p).empty());
+    for (int rank : { 0, 3, -1 }) {
+        p.skip_map_rank = rank;
+        CHECK_IN("map rank", refusal(p).find("map rank") != std::string::npos);
+    }
+    p.skip_map_rank = 2;
+    CHECK(refusal(p).empty());
+    for (float w : { -0.5f, NAN, INFINITY }) {
+        p.skip_weight = w;
+        CHECK_IN("weight", refusal(p).find("skip weight") != std::string::npos);
+    }
+}
+
 static void test_concurrent_misses() {
     std::atomic<int> inside{0};
     std::atomic<int> most{0};
@@ -1586,6 +1651,7 @@ int main(int argc, char ** argv) {
     test_concurrent_misses();
     test_wait_modes();
     test_wait_arg();
+    test_skip_arg();
     test_preads_counted();
     test_gate_table();
     test_gate_deferred();

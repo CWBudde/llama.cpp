@@ -123,7 +123,12 @@ struct llama_expert_cache {
     // [EXPERIMENTAL] the GPU remap (--expert-cache-gpu-remap): no CPU op; the layer's matmuls read
     // their ids from the slot ids, which the Metal backend's gate fills from the layer's table
     bool gpu_remap() const { return gpu_remap_on; }
-    void bind_gate(ggml_tensor * mul_mat_id, int il) const;
+    void bind_gate(ggml_tensor * mul_mat_id, int il, ggml_tensor * weights = nullptr) const;
+
+    // [EXPERIMENTAL, lossy] the skip (--expert-cache-skip): in a gated graph of one token, the Metal gate
+    // leaves an id without a slot unread when its weight ranks 4th or lower of the token and is below
+    // the threshold; it zeroes that weight, so bind_gate gets the layer's router weights
+    bool skip_on() const { return skip_weight > 0; }
 
     // whether the graph of a ubatch of n_tokens runs behind the gates: with the GPU remap, every
     // ubatch whose experts always fit the slots. A larger one, which only waves allow, takes the CPU
@@ -191,6 +196,8 @@ private:
     bool gpu_remap_on;
     llama_expert_wait wait; // how a remap waits for its loads
     bool waves;    // asked for: see waves_on()
+    float skip_weight   = 0; // off with 0
+    int   skip_map_rank = 1; // 1 or 2; 2 is a test hook: with the weight zeroed the slot does not matter
 
     std::vector<tensors>  stacked;
     std::vector<tensors>  slot_t; // the slot tensors; offs unused
@@ -203,6 +210,7 @@ private:
     std::vector<ggml_tensor *> gate_table;
     std::vector<ggml_tensor *> gate_slots;
     std::vector<int32_t>       gate_scratch;
+    std::vector<int32_t>       gate_kept; // the ids of a gate's log that it did not skip
     int      gate_seen = 0;           // layers through their gate in this graph
     int      gate_il   = -1;          // the last of them
     uint64_t gate_runs[2]  = {0, 0};  // command buffers per phase

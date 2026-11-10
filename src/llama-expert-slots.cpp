@@ -82,6 +82,11 @@ llama_expert_cache_counts llama_expert_slots::counts(bool decode) const {
     return decode ? c_decode : c_prefill;
 }
 
+void llama_expert_slots::add_skipped(bool decode, int n) {
+    std::lock_guard<std::mutex> lock(mtx);
+    counts_of(decode).skipped += n;
+}
+
 bool llama_expert_slots::failure(int & l, int & e) const {
     std::lock_guard<std::mutex> lock(mtx);
     l = failed_layer;

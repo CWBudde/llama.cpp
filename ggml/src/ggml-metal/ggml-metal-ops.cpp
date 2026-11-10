@@ -2843,6 +2843,15 @@ static void ggml_metal_op_expert_gate(ggml_metal_op_t ctx, ggml_tensor * op, int
     const ggml_tensor * slots = op->src[3];
     const ggml_tensor * table = op->src[4];
 
+    // [lossy] the skip: the router weights of the ids, which the gate ranks and zeroes; one token only
+    const ggml_tensor * weights = op->src[5];
+    float skip_w = 0.0f;
+    if (weights && ids->ne[1] == 1) {
+        const int32_t bits = ggml_get_op_params_i32(slots, 2);
+        memcpy(&skip_w, &bits, sizeof(skip_w));
+        GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_nelements(weights) == ggml_nelements(ids) && ggml_is_contiguous(weights) && ggml_is_contiguous(ids));
+    }
+
     // the router has written its ids; nothing else of this layer runs alongside the gate
     ggml_metal_op_concurrency_reset(ctx);
 
@@ -2862,6 +2871,8 @@ static void ggml_metal_op_expert_gate(ggml_metal_op_t ctx, ggml_tensor * op, int
         /*.gate     =*/ (uint32_t) gate,
         /*.entry    =*/ next + (ggml_metal_encoder_gate_active(enc) ? 1 : 0),
         /*.hdr      =*/ GGML_METAL_GATE_HDR,
+        /*.skip_w   =*/ skip_w,
+        /*.skip_map =*/ ggml_get_op_params_i32(slots, 3),
     };
 
     ggml_metal_buffer_id bid_words = { ctx->gates->metal_buf, 0 };
@@ -2872,6 +2883,8 @@ static void ggml_metal_op_expert_gate(ggml_metal_op_t ctx, ggml_tensor * op, int
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(table), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(slots), 3);
     ggml_metal_encoder_set_buffer  (enc, bid_words,                       4);
+    // without the skip the kernel does not touch it: any buffer serves
+    ggml_metal_encoder_set_buffer  (enc, skip_w > 0.0f ? ggml_metal_get_buffer_id(weights) : ggml_metal_get_buffer_id(slots), 5);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
 

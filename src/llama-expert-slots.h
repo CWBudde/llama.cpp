@@ -21,6 +21,8 @@ struct llama_expert_cache_counts {
     uint64_t hits           = 0; // needed and ready
     uint64_t hits_loading   = 0; // needed while a prefetch of it was queued or running: awaited, not repeated
     uint64_t misses         = 0; // needed and not in the cache: loaded on demand
+    uint64_t skipped        = 0; // [lossy] ids the Metal gate left out by --expert-cache-skip: neither needed nor a
+                                 // miss, so in a one-token ubatch hits + hits_loading + misses + skipped = ids
     uint64_t evictions      = 0; // a ready expert replaced
     uint64_t demand_bytes   = 0; // read for misses
     uint64_t prefetch_bytes = 0; // read for prefetches
@@ -135,6 +137,9 @@ struct llama_expert_slots {
     bool failure(int & l, int & e) const;
 
     llama_expert_cache_counts counts(bool decode) const;
+
+    // [lossy] n ids that the Metal gate skipped: counted, never loaded
+    void add_skipped(bool decode, int n);
 
 private:
     enum slot_state { EMPTY, LOADING, READY };
