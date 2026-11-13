@@ -13,6 +13,7 @@
 // takes them. Every expert (or EXPERTS_PER_LAYER spread over each layer) reads the same bytes on
 // both paths, at 3 and at 1 pread.
 
+#include "../src/llama-expert-cache.h"
 #include "../src/llama-expert-sidefile.h"
 #include "../src/llama-expert-slots.h"
 #include "arg.h"
@@ -1155,6 +1156,299 @@ static void test_gate_deferred() {
     CHECK(a.n_loads == b.n_loads && !b.overlap);
 }
 
+// a ubatch of n_tok token rows of k distinct experts each: row t uses the hot expert t % n_hot and
+// k-1 others that rotate through the rest
+static std::vector<int32_t> wave_ids(int n_tok, int k, int n_hot, int n_expert) {
+    std::vector<int32_t> ids;
+    for (int t = 0; t < n_tok; ++t) {
+        ids.push_back(t % n_hot);
+        for (int j = 1; j < k; ++j) {
+            ids.push_back(n_hot + (t*(k-1) + j - 1) % (n_expert - n_hot));
+        }
+    }
+    return ids;
+}
+
+// stages every wave of a plan, as the graph would, and checks after each stage what the graph
+// relies on: the pairs of the wave map to slots holding their expert; every other pair of a row
+// gets a distinct slot that holds some expert; and none of these slots changes while the wave's
+// GEMMs would run (here: until the loads queued so far have finished). It returns the number of
+// waves, or -1 after a failed stage.
+static int run_waves(fake & f, llama_expert_slots & c, int l, const std::vector<int32_t> & ids, int k, int cap, int n_built, int plan_built = 0) {
+    const int n = (int) ids.size();
+    const int n_waves = c.plan_waves(l, ids.data(), n, k, cap, plan_built);
+    if (n_waves < 0) {
+        return -1;
+    }
+    std::vector<int> waves_of_pair(n, 0);
+    for (int w = 0; w < std::max(n_built, n_waves); ++w) {
+        std::vector<int32_t> out(n, -1);
+        std::vector<float>   mask(n, -1.0f);
+        if (!c.stage_wave(l, w, ids.data(), n, k, out.data())) {
+            return -1;
+        }
+        c.wave_mask(l, w, ids.data(), n, mask.data());
+        std::vector<int> held(n);
+        for (int i = 0; i < n; ++i) {
+            const bool in = c.wave_of(l, ids[i]) == w;
+            CHECK(mask[i] == (in ? 1.0f : 0.0f));
+            CHECK(out[i] >= 0 && out[i] < f.n_slots);
+            held[i] = out[i] >= 0 && out[i] < f.n_slots ? f.at(l, out[i]) : -2;
+            CHECK(in ? held[i] == ids[i] : held[i] >= 0);
+            waves_of_pair[i] += in;
+        }
+        for (int t = 0; t < n/k; ++t) {
+            std::set<int32_t> row(out.begin() + t*k, out.begin() + (t+1)*k);
+            CHECK((int) row.size() == k);
+        }
+        c.drain(); // the next wave's preloads have landed: none may have hit a slot this wave reads
+        for (int i = 0; i < n; ++i) {
+            CHECK(out[i] >= 0 && out[i] < f.n_slots && f.at(l, out[i]) == held[i]);
+        }
+    }
+    for (int i = 0; i < n; ++i) {
+        CHECK(waves_of_pair[i] == 1); // the per-wave sum adds each pair exactly once
+    }
+    return n_waves;
+}
+
+static void test_wave_cap() {
+    CHECK(llama_expert_wave_cap(128, 6) == 61);
+    CHECK(llama_expert_wave_cap(18, 6) == 6);
+    CHECK(llama_expert_wave_cap(17, 6) == 0); // fewer than 3k slots: no waves
+    CHECK(llama_expert_wave_cap(384, 6) == 189);
+
+    // the graph holds as many waves as it takes with waves of up to slots - k experts
+    CHECK(llama_expert_wave_count(384, 128, 6) == 4);
+    CHECK(llama_expert_wave_count(384, 64, 6) == 7);
+    CHECK(llama_expert_wave_count(132, 128, 6) == 2);
+    CHECK(llama_expert_wave_count(40, 18, 6) == 4);
+}
+
+static void test_waves_plan() {
+    // 20 experts used by 12 rows of 3: 0..3 are hot (3 rows each), 4..19 rotate (1-2 rows each)
+    fake f(1, 20);
+    auto c = make(f, 32, 2);
+    const int k = 3, cap = llama_expert_wave_cap(20, k);
+    CHECK(cap == 8);
+    const auto ids = wave_ids(12, k, 4, 20);
+    CHECK(c->plan_waves(0, ids.data(), (int) ids.size(), k, 2) < 0); // a wave below k
+    const int n_waves = c->plan_waves(0, ids.data(), (int) ids.size(), k, cap);
+    CHECK(n_waves == 3);
+    // each expert in exactly one wave, at most cap per wave, the most used last
+    std::vector<int> size(n_waves, 0);
+    for (int e = 0; e < 20; ++e) {
+        const int w = c->wave_of(0, e);
+        CHECK(w >= 0 && w < n_waves);
+        if (w >= 0 && w < n_waves) {
+            size[w]++;
+        }
+    }
+    for (int s : size) {
+        CHECK(s <= cap);
+    }
+    for (int e = 0; e < 4; ++e) {
+        CHECK(c->wave_of(0, e) == n_waves - 1);
+    }
+    CHECK(c->wave_of(0, 25) < 0);
+    // ids out of range plan nothing
+    const int32_t bad[] = {0, 1, 40};
+    CHECK(c->plan_waves(0, bad, 3, k, cap) < 0);
+}
+
+static void test_waves_stage() {
+    // 2 layers, 18 slots, k 6: cap 6, so 64 rows over 40 experts take 7 waves; one layer has
+    // stale experts from a decode remap first; slow loads, so preloads overlap the "GEMMs"
+    fake f(2, 18);
+    f.delay_us = 200;
+    auto c = make(f, 48, 4);
+    const int k = 6, cap = llama_expert_wave_cap(18, k);
+    std::vector<int32_t> out;
+    CHECK(remap(*c, 1, {40, 41, 42, 43, 44, 45}, out));
+    for (int l = 0; l < 2; ++l) {
+        const auto ids = wave_ids(64, k, 5, 40);
+        CHECK(run_waves(f, *c, l, ids, k, cap, 9) == 7); // two empty waves built beyond the plan
+    }
+    CHECK(!f.overlap);
+    const auto p = c->counts(false);
+    CHECK(p.steps == 2 && p.needed == 80 && p.waves == 14 && p.waves_built == 18);
+    CHECK(p.hits + p.hits_loading + p.misses == p.needed);
+    CHECK(p.misses == 80 && p.demand_bytes == 100*80 && p.load_failures == 0);
+    CHECK(p.prefetch_issued == 0 && p.wave_parked > 0);
+    // the most used experts of the last ubatch are what the slots hold afterwards
+    for (int e = 0; e < 5; ++e) {
+        CHECK(c->slot_of(1, e) >= 0);
+    }
+    // a second identical ubatch: its last wave is resident, the rest loads again
+    const auto ids = wave_ids(64, k, 5, 40);
+    CHECK(run_waves(f, *c, 0, ids, k, cap, 7) == 7);
+    CHECK(c->counts(false).hits > 0);
+}
+
+static void test_waves_tight() {
+    // a cap above llama_expert_wave_cap: a wave and the next one's preloads no longer fit in the
+    // slots together, so the preloads find too few victims; they must not take the wave's own
+    // slots, and the experts that find none load at their own stage
+    fake f(1, 18);
+    f.delay_us = 100;
+    auto c = make(f, 48, 4);
+    const auto ids = wave_ids(64, 6, 5, 40);
+    CHECK(run_waves(f, *c, 0, ids, 6, 10, 0) == 4);
+    CHECK(run_waves(f, *c, 0, ids, 6, 10, 0) == 4);
+    CHECK(!f.overlap);
+    const auto p = c->counts(false);
+    CHECK(p.hits + p.hits_loading + p.misses == p.needed && p.load_failures == 0);
+}
+
+static void test_waves_built() {
+    // the graph's 4 waves are enough at 18 slots: a union of 40 grows its waves from 6 to 10
+    const int k = 6, cap = llama_expert_wave_cap(18, k), built = llama_expert_wave_count(40, 18, k);
+    {
+        fake f(1, 18);
+        f.delay_us = 100;
+        auto c = make(f, 48, 4);
+        const auto ids = wave_ids(64, k, 5, 40);
+        CHECK(run_waves(f, *c, 0, ids, k, cap, built, built) == built);
+        CHECK(run_waves(f, *c, 0, ids, k, cap, built, built) == built);
+        CHECK(!f.overlap);
+        const auto p = c->counts(false);
+        CHECK(p.waves == 2*(uint64_t) built && p.waves_built == 2*(uint64_t) built);
+        CHECK(p.hits + p.hits_loading + p.misses == p.needed && p.load_failures == 0);
+        // more waves than 4 are needed with the cap alone, one is too few for the slots
+        CHECK(c->plan_waves(0, ids.data(), (int) ids.size(), k, cap) == 7);
+        CHECK(c->plan_waves(0, ids.data(), (int) ids.size(), k, cap, 1) < 0);
+    }
+    {
+        // a smaller union keeps waves of the cap; the graph's last wave stays empty, parked
+        fake f(1, 18);
+        auto c = make(f, 48, 4);
+        const auto ids = wave_ids(12, k, 3, 13);
+        CHECK(run_waves(f, *c, 0, ids, k, cap, built, built) == 3);
+        const auto p = c->counts(false);
+        CHECK(p.waves == 3 && p.waves_built == 4);
+    }
+}
+
+static void test_waves_next_resident() {
+    // the next wave is resident, and a wave above the cap does not fit beside all of it: it takes
+    // what it needs of the next wave's slots, instead of waiting for a slot that never frees
+    fake f(1, 18);
+    auto c = make(f, 48, 2);
+    std::vector<int32_t> out;
+    std::vector<int32_t> next;
+    for (int e = 10; e < 20; ++e) {
+        next.push_back(e);
+    }
+    CHECK(remap(*c, 0, next, out));
+    // experts 0..9 once, 10..19 twice: wave 0 is 0..9, wave 1 is 10..19
+    const std::vector<int32_t> ids = {
+        0, 1, 2, 3, 4, 5,  6, 7, 8, 9, 10, 11,  12, 13, 14, 15, 16, 17,  18, 19, 10, 11, 12, 13,  14, 15, 16, 17, 18, 19,
+    };
+    const int k = 6, cap = llama_expert_wave_cap(18, k);
+    CHECK(run_waves(f, *c, 0, ids, k, cap, 2, 2) == 2);
+    for (int e = 0; e < 10; ++e) {
+        CHECK(c->wave_of(0, e) == 0);
+        CHECK(c->wave_of(0, e + 10) == 1);
+    }
+    const auto p = c->counts(false);
+    CHECK(p.needed == 20 && p.hits == 8 && p.misses == 12 && p.hits_loading == 0);
+}
+
+static void test_waves_prefetched() {
+    // a decode's prefetch that a wave uses is credited as used, and one nobody uses as wasted
+    fake f(1, 18);
+    auto c = make(f, 48, 2);
+    const int pre[] = {0, 1, 2, 45};
+    c->prefetch(0, pre, 4, true);
+    c->drain();
+    const int k = 6, cap = llama_expert_wave_cap(18, k);
+    const auto ids = wave_ids(64, k, 5, 40);
+    CHECK(run_waves(f, *c, 0, ids, k, cap, 7) == 7);
+    CHECK(run_waves(f, *c, 0, ids, k, cap, 7) == 7);
+    const auto d = c->counts(true);
+    CHECK(d.prefetch_issued == 4 && d.prefetch_used == 3 && d.prefetch_wasted == 1);
+}
+
+// a wave stage waits through the configured wait mode: the same plans, every mode; the tight cap
+// leaves the stage short of victims, so it also waits for a slot
+static void test_waves_wait_modes() {
+    for (const auto mode : {llama_expert_wait::SLEEP, llama_expert_wait::SPIN, llama_expert_wait::HYBRID, llama_expert_wait::QOS}) {
+        llama_expert_wait wait;
+        wait.mode    = mode;
+        wait.spin_us = mode == llama_expert_wait::HYBRID ? 50 : 0;
+        fake f(1, 18);
+        f.delay_us = 100;
+        auto c = make(f, 48, 4, 100, wait);
+        const int k = 6;
+        const auto ids = wave_ids(64, k, 5, 40);
+        const bool ok = on_thread("waves", [&] {
+            return run_waves(f, *c, 0, ids, k, llama_expert_wave_cap(18, k), 0) == 7 && run_waves(f, *c, 0, ids, k, 10, 0) == 4;
+        }).ok;
+        CHECK(ok);
+        CHECK(!f.overlap);
+        const auto p = c->counts(false);
+        CHECK(p.hits + p.hits_loading + p.misses == p.needed && p.load_failures == 0 && p.wait_seconds > 0);
+    }
+}
+
+// after a graph on the CPU remap (waves) the GPU remap's tables are refreshed: with every load
+// done, each layer's entry for an expert is the slot that holds it, else -1. A table copied before
+// the waves names slots whose experts the waves replaced: hence the refresh.
+static void test_waves_refresh_tables() {
+    const int n_expert = 48, k = 6;
+    fake f(2, 18);
+    f.delay_us = 200;
+    auto c = make(f, n_expert, 4);
+    std::vector<std::vector<int32_t>> tables(2, std::vector<int32_t>(n_expert, -2));
+    std::vector<int32_t *> ptrs = {tables[0].data(), tables[1].data()};
+    // decode ubatches behind the gates first: a stopped gate copies its layer's table
+    std::vector<int32_t> out;
+    for (int l = 0; l < 2; ++l) {
+        CHECK(remap(*c, l, {40, 41, 42, 43, 44, 45}, out));
+        c->copy_table(l, ptrs[l]);
+        CHECK(ptrs[l][40] >= 0 && f.at(l, ptrs[l][40]) == 40);
+    }
+    // a prefill ubatch in waves over both layers evicts them
+    const auto ids = wave_ids(64, k, 5, 40);
+    for (int l = 0; l < 2; ++l) {
+        CHECK(run_waves(f, *c, l, ids, k, llama_expert_wave_cap(18, k), 0) == 7);
+    }
+    int stale = 0;
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_expert; ++e) {
+            const int s = tables[l][e];
+            stale += s >= 0 && f.at(l, s) != e;
+        }
+    }
+    CHECK(stale > 0);
+    // loads still running at the refresh: it waits for them, so they are in the table
+    const int pf[] = {44, 45, 46, 47};
+    c->prefetch(0, pf, 4, false);
+    c->refresh_tables(ptrs.data());
+    int resident = 0;
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_expert; ++e) {
+            const int s = tables[l][e];
+            CHECK(s == c->slot_of(l, e));
+            CHECK(s == -1 || (s >= 0 && s < f.n_slots && f.at(l, s) == e));
+            resident += s >= 0;
+        }
+    }
+    CHECK(resident == 2*f.n_slots);
+    CHECK(tables[0][47] >= 0 && f.at(0, tables[0][47]) == 47);
+}
+
+static void test_waves_failure() {
+    fake f(1, 18);
+    auto c = make(f, 48, 2);
+    const int k = 6, cap = llama_expert_wave_cap(18, k);
+    f.failing.insert({0, 30});
+    const auto ids = wave_ids(32, k, 5, 40);
+    CHECK(run_waves(f, *c, 0, ids, k, cap, 0) < 0);
+    int l = -1, e = -1;
+    CHECK(c->failure(l, e) && l == 0 && e == 30);
+}
+
 static void test_top_k() {
     std::vector<int> out;
     llama_expert_top_k({0.5, 2.0, 1.0, 2.0, 0.0}, 3, out);
@@ -1205,6 +1499,61 @@ static void test_markov_fixture(const char * path) {
     printf("markov fixture: %zu steps, %zu predictions over %zu parameter sets, as the Go predictor\n", steps.size(), n_pred, j["params"].size());
 }
 
+// a cache with these params constructs (nothing is loaded before init), or the error it throws
+static std::string cache_refusal(const llama_expert_cache_params & p) {
+    try {
+        llama_expert_cache c(p, 2, 16, 2);
+    } catch (const std::exception & e) {
+        return e.what();
+    }
+    return "";
+}
+
+// the GPU remap runs with waves (prefill on the CPU remap, decode behind the gates), not with
+// prefetch: the error names both options
+static void test_gpu_remap_combinations() {
+    auto p = llama_expert_cache_default_params();
+    p.n_slots   = 8;
+    p.waves     = true;
+    p.gpu_remap = true;
+    CHECK(cache_refusal(p).empty());
+    p.prefetch_k = 4;
+    const std::string err = cache_refusal(p);
+    CHECK(err.find("--expert-cache-gpu-remap") != std::string::npos && err.find("--expert-prefetch") != std::string::npos);
+    p.waves = false;
+    CHECK(cache_refusal(p).find("--expert-prefetch") != std::string::npos);
+    p.prefetch_k = 0;
+    CHECK(cache_refusal(p).empty());
+}
+
+// with waves the ubatch is unbounded, while the GPU remap's slot ids keep the capped size; a graph
+// runs behind the gates exactly when its ubatch fits them
+static void test_gate_ubatch() {
+    auto p = llama_expert_cache_default_params();
+    p.n_slots = 8;
+    p.waves   = true;
+    const llama_expert_cache a(p, 2, 16, 2);
+    CHECK(a.waves_on() && a.max_ubatch() == UINT32_MAX && a.gate_ubatch() == 4);
+    CHECK(!a.gpu_graph(1, 2) && !a.gpu_graph(4, 2) && !a.gpu_graph(512, 2)); // no GPU remap: no gates
+    p.gpu_remap = true;
+    const llama_expert_cache b(p, 2, 16, 2);
+    CHECK(b.waves_on() && b.max_ubatch() == UINT32_MAX && b.gate_ubatch() == 4);
+    CHECK(b.gpu_graph(1, 2) && b.gpu_graph(4, 2) && !b.gpu_graph(5, 2) && !b.gpu_graph(512, 2));
+    CHECK(b.gpu_graph(4, 1)); // a smaller top-k fits the gate's slot ids
+    // without waves every ubatch of the context fits the gates, as before
+    p.waves = false;
+    const llama_expert_cache c(p, 2, 16, 2);
+    CHECK(!c.waves_on() && c.max_ubatch() == 4 && c.gate_ubatch() == 4);
+    for (uint32_t n = 1; n <= c.max_ubatch(); ++n) {
+        CHECK(c.gpu_graph(n, 2));
+    }
+    CHECK(c.gpu_graph(512, 2)); // a reserved graph above the cap stays gated, as before
+    // a warmup graph routes all experts, wider than the gate's slot ids: the CPU remap, with or
+    // without waves, however small its ubatch
+    CHECK(!b.gpu_graph(1, 16) && !b.gpu_graph(4, 3));
+    CHECK(!c.gpu_graph(1, 16) && !c.gpu_graph(4, 3));
+}
+
 // a draft model gets the target's params except its expert cache: Kolibri only, one context per model
 static void test_draft_params() {
     common_params target;
@@ -1245,6 +1594,18 @@ int main(int argc, char ** argv) {
     test_preads_counted();
     test_gate_table();
     test_gate_deferred();
+    test_wave_cap();
+    test_waves_plan();
+    test_waves_stage();
+    test_waves_tight();
+    test_waves_built();
+    test_waves_next_resident();
+    test_waves_prefetched();
+    test_waves_failure();
+    test_waves_wait_modes();
+    test_waves_refresh_tables();
+    test_gpu_remap_combinations();
+    test_gate_ubatch();
     test_top_k();
     test_sha256();
 #ifdef HAVE_SIDEFILE_TESTS

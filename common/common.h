@@ -546,6 +546,7 @@ struct common_params {
     bool                 expert_cache_gpu_remap    = false; // map router ids to slots on the GPU
     llama_expert_cache_wait expert_cache_wait      = LLAMA_EXPERT_CACHE_WAIT_SLEEP; // how a remap waits for its loads
     int32_t              expert_cache_wait_us      = 0;     // the spin of LLAMA_EXPERT_CACHE_WAIT_HYBRID, microseconds per remap
+    bool                 expert_cache_waves        = false; // run large ubatches in waves instead of capping them
     llama_expert_cache_params expert_cache_lp = {};         // what common_model_params_to_llama hands to the model
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)

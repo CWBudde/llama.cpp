@@ -115,12 +115,16 @@ static void test(void) {
         base.expert_cache_layers = {128};
         base.expert_cache_stats = "stats.json";
         base.expert_cache_sidefile = "experts.side";
+        base.expert_cache_gpu_remap = true;
+        base.expert_cache_waves = true;
         {
             const auto draft = common_base_params_to_speculative(base);
             assert(draft.expert_cache == 0);
             assert(draft.expert_cache_layers.empty());
             assert(draft.expert_cache_stats.empty());
             assert(draft.expert_cache_sidefile.empty());
+            assert(!draft.expert_cache_gpu_remap);
+            assert(!draft.expert_cache_waves);
         }
     }
 

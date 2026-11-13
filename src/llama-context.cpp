@@ -1662,9 +1662,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
 
     // [EXPERIMENTAL] the gates ran synchronously, each layer once, or a layer left the GPU; the last
-    // layer keeps only the output rows, so with no output in this ubatch it has no matmuls
+    // layer keeps only the output rows, so with no output in this ubatch it has no matmuls. A graph
+    // on the CPU remap (a ubatch above the gates, in waves) moved experts the tables do not know of:
+    // they are copied again before a gate reads them. Its matmuls may still run, but they read the
+    // slots, which no load writes any more, and not the tables; the next gated graph waits for them.
     if (model.expert_cache && model.expert_cache->gpu_remap()) {
-        if (status == GGML_STATUS_SUCCESS) {
+        // the graph's top-k, as llm_graph_context takes it: warmup routes all experts
+        const int k = (int) (cparams.warmup ? model.hparams.n_expert : model.hparams.n_expert_used());
+        if (!model.expert_cache->gpu_graph(ubatch.n_tokens, k)) {
+            model.expert_cache->refresh_tables();
+        } else if (status == GGML_STATUS_SUCCESS) {
             model.expert_cache->gate_check_graph(n_outputs > 0);
         } else {
             model.expert_cache->gate_abandon_graph();
@@ -2650,6 +2657,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
+    }
+
+    // [EXPERIMENTAL] the expert cache's waves repeat the expert matmuls of a layer
+    if (model.expert_cache) {
+        res += model.expert_cache->wave_nodes((int) n_tokens);
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling

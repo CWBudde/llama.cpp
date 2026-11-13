@@ -506,7 +506,8 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 //    have not run, and no later node has overwritten a tensor that the resumed run still reads;
 //  - the matmuls of the layers before it are complete: they precede the gate in a completed buffer;
 //  - there is no asynchronous writer: the expert cache refuses prefetch in this mode, and gate_remap
-//    returns only when its layer's loads are done.
+//    returns only when its layer's loads are done. A graph without gates (a ubatch above them, in
+//    waves on the CPU remap) is followed by refresh_tables, which waits for its loads.
 //
 // Hence a slot a matmul reads cannot be evicted or written while it runs, as before.
 static void ggml_metal_gate_remap(ggml_metal_t ctx, const struct ggml_tensor * op, bool stopped) {

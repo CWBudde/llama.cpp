@@ -1737,6 +1737,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (params.expert_cache && params.expert_cache->gpu_remap && !expert_cache_requested()) {
             throw std::runtime_error("expert cache: --expert-cache-gpu-remap needs --expert-cache or --expert-cache-layers");
         }
+        if (params.expert_cache && params.expert_cache->waves && !expert_cache_requested()) {
+            throw std::runtime_error("expert cache: --expert-cache-waves needs --expert-cache or --expert-cache-layers");
+        }
 
         if (expert_cache_requested()) {
             if (arch != LLM_ARCH_KOLIBRI1) {
@@ -3471,6 +3474,7 @@ llama_expert_cache_params llama_expert_cache_default_params() {
         /*.gpu_remap          =*/ false,
         /*.wait_mode          =*/ LLAMA_EXPERT_CACHE_WAIT_SLEEP,
         /*.wait_spin_us       =*/ 0,
+        /*.waves              =*/ false,
     };
 
     return result;
