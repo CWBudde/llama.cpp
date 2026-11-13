@@ -2365,9 +2365,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * ids_cont = nullptr; // with waves: the router's ids, contiguous
     int n_waves = 1;
     // with the GPU remap, a graph whose ubatch fits the gates runs behind them; a larger ubatch (waves)
-    // takes the CPU remap. The graph's ubatch decides, not this layer's rows (the last layer may keep
-    // only the outputs), so that a graph is gated in every layer or in none.
-    const bool gated = expert_cache && il >= 0 && expert_cache->gpu_graph((uint32_t) this->n_tokens);
+    // or a warmup graph (top-k above the gate's width) takes the CPU remap. The graph's ubatch and
+    // top-k decide, not this layer's rows (the last layer may keep only the outputs) or k, so that a
+    // graph is gated in every layer or in none; llama_context::process_ubatch asks the same.
+    const bool gated = expert_cache && il >= 0 && expert_cache->gpu_graph((uint32_t) this->n_tokens, (int) this->n_expert_used);
     if (expert_cache && il >= 0) {
         GGML_ASSERT(!slots);
         GGML_ASSERT(!gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s);

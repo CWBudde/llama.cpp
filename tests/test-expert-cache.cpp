@@ -1534,19 +1534,24 @@ static void test_gate_ubatch() {
     p.waves   = true;
     const llama_expert_cache a(p, 2, 16, 2);
     CHECK(a.waves_on() && a.max_ubatch() == UINT32_MAX && a.gate_ubatch() == 4);
-    CHECK(!a.gpu_graph(1) && !a.gpu_graph(4) && !a.gpu_graph(512)); // no GPU remap: no gates
+    CHECK(!a.gpu_graph(1, 2) && !a.gpu_graph(4, 2) && !a.gpu_graph(512, 2)); // no GPU remap: no gates
     p.gpu_remap = true;
     const llama_expert_cache b(p, 2, 16, 2);
     CHECK(b.waves_on() && b.max_ubatch() == UINT32_MAX && b.gate_ubatch() == 4);
-    CHECK(b.gpu_graph(1) && b.gpu_graph(4) && !b.gpu_graph(5) && !b.gpu_graph(512));
+    CHECK(b.gpu_graph(1, 2) && b.gpu_graph(4, 2) && !b.gpu_graph(5, 2) && !b.gpu_graph(512, 2));
+    CHECK(b.gpu_graph(4, 1)); // a smaller top-k fits the gate's slot ids
     // without waves every ubatch of the context fits the gates, as before
     p.waves = false;
     const llama_expert_cache c(p, 2, 16, 2);
     CHECK(!c.waves_on() && c.max_ubatch() == 4 && c.gate_ubatch() == 4);
     for (uint32_t n = 1; n <= c.max_ubatch(); ++n) {
-        CHECK(c.gpu_graph(n));
+        CHECK(c.gpu_graph(n, 2));
     }
-    CHECK(c.gpu_graph(512)); // a reserved graph above the cap stays gated, as before
+    CHECK(c.gpu_graph(512, 2)); // a reserved graph above the cap stays gated, as before
+    // a warmup graph routes all experts, wider than the gate's slot ids: the CPU remap, with or
+    // without waves, however small its ubatch
+    CHECK(!b.gpu_graph(1, 16) && !b.gpu_graph(4, 3));
+    CHECK(!c.gpu_graph(1, 16) && !c.gpu_graph(4, 3));
 }
 
 // a draft model gets the target's params except its expert cache: Kolibri only, one context per model

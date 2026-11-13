@@ -1667,7 +1667,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // they are copied again before a gate reads them. Its matmuls may still run, but they read the
     // slots, which no load writes any more, and not the tables; the next gated graph waits for them.
     if (model.expert_cache && model.expert_cache->gpu_remap()) {
-        if (!model.expert_cache->gpu_graph(ubatch.n_tokens)) {
+        // the graph's top-k, as llm_graph_context takes it: warmup routes all experts
+        const int k = (int) (cparams.warmup ? model.hparams.n_expert : model.hparams.n_expert_used());
+        if (!model.expert_cache->gpu_graph(ubatch.n_tokens, k)) {
             model.expert_cache->refresh_tables();
         } else if (status == GGML_STATUS_SUCCESS) {
             model.expert_cache->gate_check_graph(n_outputs > 0);

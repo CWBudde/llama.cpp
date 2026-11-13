@@ -125,12 +125,15 @@ struct llama_expert_cache {
     bool gpu_remap() const { return gpu_remap_on; }
     void bind_gate(ggml_tensor * mul_mat_id, int il) const;
 
-    // whether the graph of a ubatch of n_tokens runs behind the gates: with the GPU remap, every
-    // ubatch whose experts always fit the slots. A larger one, which only waves allow, takes the CPU
-    // remap and its waves. Without waves every graph is gated, as the context caps its ubatch anyway
-    // (only a reserved graph can be larger). The graph's n_tokens decides, so a reused graph keeps
-    // its path.
-    bool gpu_graph(uint32_t n_tokens) const { return gpu_remap_on && (!waves_on() || n_tokens <= gate_ubatch()); }
+    // whether the graph of a ubatch of n_tokens that routes k experts per token runs behind the
+    // gates: with the GPU remap, every ubatch whose experts always fit the slots. A larger one, which
+    // only waves allow, takes the CPU remap and its waves. Without waves every graph is gated, as the
+    // context caps its ubatch anyway (only a reserved graph can be larger). A k above n_expert_used
+    // (warmup routes all experts) would overrun the gate's slot ids, so that graph takes the CPU remap
+    // too. The graph's n_tokens and k decide, so a reused graph keeps its path.
+    bool gpu_graph(uint32_t n_tokens, int k) const {
+        return gpu_remap_on && k <= n_expert_used && (!waves_on() || n_tokens <= gate_ubatch());
+    }
 
     // after a graph on the CPU remap in a GPU remap context: the waves moved experts the tables do
     // not know of, so every layer's table is copied again, once the loads are done
