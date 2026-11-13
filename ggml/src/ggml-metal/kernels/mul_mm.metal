@@ -1084,11 +1084,51 @@ kernel void kernel_expert_gate(
         device const char    * ids   [[buffer(1)]],
         device const int32_t * table [[buffer(2)]],
         device       int32_t * slots [[buffer(3)]],
-        device       uint32_t * words [[buffer(4)]]) {
+        device       uint32_t * words [[buffer(4)]],
+        device       float   * weights [[buffer(5)]]) {
     device int32_t * logged = slots + args.n_log;
 
     bool miss = false;
-    for (int t = 0; t < args.n_tokens; ++t) {
+
+    // [lossy] the skip, for a ubatch of one token (args.skip_w > 0 only then): an id without a slot at
+    // weight rank 4 or below of the token, with a weight below skip_w, does not stop the buffer. It is
+    // logged as -1 - id, reads the slot of the token's rank-skip_map id, and its weight becomes 0.
+    // Ranks go by weight, the earlier position first of equal weights. A gate that stops writes
+    // neither slots nor weights, so the resumed gate ranks the same weights.
+    if (args.skip_w > 0.0f) {
+        device const int32_t * row = (device const int32_t *) ids;
+        int target = 0;
+        for (int i = 0; i < args.n_used; ++i) {
+            const float w = weights[i];
+            int rank = 1;
+            for (int j = 0; j < args.n_used; ++j) {
+                const float v = weights[j];
+                rank += (v > w || (v == w && j < i)) ? 1 : 0;
+            }
+            if (rank == args.skip_map) {
+                target = i;
+            }
+            const int32_t id = row[i];
+            const bool skip  = table[id] < 0 && rank >= 4 && w < args.skip_w;
+            logged[i] = skip ? -1 - id : id;
+            if (table[id] < 0 && !skip) {
+                miss = true;
+            }
+        }
+        if (!miss) {
+            const int32_t s_target = table[row[target]];
+            for (int i = 0; i < args.n_used; ++i) {
+                if (logged[i] < 0) {
+                    slots[i]   = s_target;
+                    weights[i] = 0.0f;
+                } else {
+                    slots[i] = table[row[i]];
+                }
+            }
+        }
+    }
+
+    for (int t = 0; args.skip_w <= 0.0f && t < args.n_tokens; ++t) {
         device const int32_t * row = (device const int32_t *) (ids + t*args.nb1);
         for (int i = 0; i < args.n_used; ++i) {
             const int32_t id = row[i];

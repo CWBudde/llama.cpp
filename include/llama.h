@@ -351,6 +351,12 @@ extern "C" {
         bool            waves;         // a ubatch with more experts than the slots runs its expert matmuls in
                                        // waves of experts instead of being capped (needs 3*n_expert_used slots;
                                        // with gpu_remap, such a ubatch runs on the CPU remap)
+        float           skip_weight;   // [lossy] where a layer computes one token (a decode step; the last layer of
+                                       // a prompt with one output), an expert that is not in the cache, at weight
+                                       // rank 4 or below of the token and with a router weight below this, is not
+                                       // read and its weight becomes 0; 0 = off (needs gpu_remap: the Metal gate
+                                       // applies it; else the model fails to load)
+        int32_t         skip_map_rank; // the token's expert whose slot a skipped id reads, 1 or 2 (a test hook; default 1)
     };
 
     struct llama_model_params {

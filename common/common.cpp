@@ -1711,7 +1711,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     // without the cache, --expert-cache-stats still asks for the decode timing of the resident model,
     // and --expert-cache-gpu-remap and --expert-cache-waves reach the model's refusal
-    if (params.expert_cache > 0 || !params.expert_cache_layers.empty() || !params.expert_cache_stats.empty() || !params.expert_cache_sidefile.empty() || params.expert_cache_gpu_remap || params.expert_cache_waves) {
+    if (params.expert_cache > 0 || !params.expert_cache_layers.empty() || !params.expert_cache_stats.empty() || !params.expert_cache_sidefile.empty() || params.expert_cache_gpu_remap || params.expert_cache_waves || params.expert_cache_skip != 0.0f) {
         auto & ec = params.expert_cache_lp;
         ec = llama_expert_cache_default_params();
         ec.n_slots            = params.expert_cache;
@@ -1728,6 +1728,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         ec.wait_mode          = params.expert_cache_wait;
         ec.wait_spin_us       = params.expert_cache_wait_us;
         ec.waves              = params.expert_cache_waves;
+        ec.skip_weight        = params.expert_cache_skip;
         mparams.expert_cache  = &ec;
     }
 

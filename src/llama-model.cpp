@@ -1737,6 +1737,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (params.expert_cache && params.expert_cache->gpu_remap && !expert_cache_requested()) {
             throw std::runtime_error("expert cache: --expert-cache-gpu-remap needs --expert-cache or --expert-cache-layers");
         }
+        if (params.expert_cache && params.expert_cache->skip_weight != 0.0f && !expert_cache_requested()) {
+            throw std::runtime_error("expert cache: --expert-cache-skip needs --expert-cache or --expert-cache-layers");
+        }
         if (params.expert_cache && params.expert_cache->waves && !expert_cache_requested()) {
             throw std::runtime_error("expert cache: --expert-cache-waves needs --expert-cache or --expert-cache-layers");
         }
@@ -1744,6 +1747,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (expert_cache_requested()) {
             if (arch != LLM_ARCH_KOLIBRI1) {
                 throw std::runtime_error(format("the expert cache supports the kolibri1 architecture only, not %s", llm_arch_name(arch)));
+            }
+            // the skip's gate zeroes entries of the router weights tensor, which must then be the tensor the
+            // experts are weighted with: normalised or softmax weights are a view of another one
+            if (params.expert_cache->skip_weight != 0.0f &&
+                    (hparams.expert_weights_norm || hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT)) {
+                throw std::runtime_error("expert cache: --expert-cache-skip does not work with normalised or softmax router weights");
             }
             // the stacked experts stay in the file: lazy tensors, mapped on the CPU and never read
             ml.lazy.mode = LLAMA_LAZY_MODE_ON;
@@ -3475,6 +3484,8 @@ llama_expert_cache_params llama_expert_cache_default_params() {
         /*.wait_mode          =*/ LLAMA_EXPERT_CACHE_WAIT_SLEEP,
         /*.wait_spin_us       =*/ 0,
         /*.waves              =*/ false,
+        /*.skip_weight        =*/ 0.0f,
+        /*.skip_map_rank      =*/ 1,
     };
 
     return result;

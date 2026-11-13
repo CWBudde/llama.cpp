@@ -2898,6 +2898,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_WAVES"));
     add_opt(common_arg(
+        {"--expert-cache-skip"}, "W",
+        "[EXPERIMENTAL, lossy] where a layer computes one token (every decode step, and the last layer of a prompt with one output), do not "
+        "read an expert that is not in the cache when the router chose it at weight rank 4 or below of the token with a weight below W: "
+        "its weight becomes 0. Needs --expert-cache-gpu-remap, "
+        "whose Metal gate applies it; otherwise the model fails to load (default: 0, off)",
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            float w = NAN;
+            try {
+                w = std::stof(value, &pos);
+            } catch (const std::exception &) {
+                pos = 0;
+            }
+            if (value.empty() || pos != value.size() || !std::isfinite(w) || w < 0.0f) {
+                throw std::invalid_argument("--expert-cache-skip " + value + ": want a finite weight >= 0");
+            }
+            params.expert_cache_skip = w;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_SKIP"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {

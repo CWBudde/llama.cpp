@@ -581,6 +581,8 @@ typedef struct {
     uint32_t gate;     // this gate's place in the graph
     uint32_t entry;    // the first indirect entry after this gate
     uint32_t hdr;      // the words before the first entry
+    float    skip_w;   // [lossy] > 0: the skip of a one-token ubatch's low-weight misses, see kernel_expert_gate
+    int32_t  skip_map; // the weight rank whose slot a skipped id reads, 1 or 2
 } ggml_metal_kargs_expert_gate;
 
 typedef struct {
